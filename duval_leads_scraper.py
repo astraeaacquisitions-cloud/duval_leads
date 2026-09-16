@@ -1,0 +1,672 @@
+"""
+Duval County Motivated Seller Lead Tracker -- data generator
+--------------------------------------------------------------
+Builds records.json (same schema/shape as the Harris County dashboard
+this was modeled on) from two live Duval County sources:
+
+  1. Official Records (or.duvalclerk.com) -- pulls the last N days,
+     filtered to "distress signal" doc types: Lis Pendens, Notice of Tax
+     Deed Sale, Judgment (all variants), Lien, Probate, Notice of
+     Commencement, and Release/Satisfaction/Cancellation.
+  2. The next scheduled tax deed auction (duval.realtaxdeed.com) -- every
+     item on it, i.e. properties about to be sold at auction.
+
+Each record is enriched with a property address + mailing address via
+the Property Appraiser (paopropertysearch.coj.net):
+  - Official Records rows are matched by the GRANTOR name (see the
+    county-data-lag caveat in duval_lead_pipeline.py -- same logic reused
+    here, including subdivision-based disambiguation for portfolio
+    owners).
+  - Tax deed items already carry an exact parcel #, so they're looked up
+    directly by RE# -- no name search needed.
+
+A 0-100 "motivated seller score" and a set of flags are computed per
+record (see compute_score_flags -- the exact rubric is documented there;
+it's a judgment call modeled on the patterns visible in the reference
+Harris County dashboard, not a scrape of their (invisible, server-side)
+scoring code).
+
+CAVEATS carried over from duval_lead_pipeline.py:
+  - Grantor-name matches can lag or mismatch for very recently recorded
+    documents (county assessment data takes time to catch up).
+  - Portfolio owners (many parcels under one name) are disambiguated by
+    legal-description/subdivision overlap, which resolves across
+    different subdivisions but not between multiple lots in the same one.
+  - Neither site offers a public deep link to the actual document image
+    (both require login) -- clerk_url points to the relevant search page
+    or, for tax deed items, directly to the parcel's Property Appraiser
+    page, which IS a real working deep link.
+
+Usage:
+    python duval_leads_scraper.py --days 7 --out records.json
+"""
+
+import argparse
+import datetime
+import json
+import re
+import time
+
+import requests
+from bs4 import BeautifulSoup
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+
+# ---------------------------------------------------------------------------
+# Official Records (or.duvalclerk.com)
+# ---------------------------------------------------------------------------
+
+OR_BASE = "https://or.duvalclerk.com"
+
+# DocTypeDescription (as it appears in the grid) -> (cat, cat_label)
+CATEGORY_MAP = {
+    "LIS PENDENS": ("foreclosure", "Lis Pendens"),
+    "NOTICE OF TAX DEED SALE": ("tax", "Notice of Tax Deed Sale"),
+    "JUDGMENT": ("judgment", "Judgment"),
+    "JUDGMENT/RESTITUTION": ("judgment", "Judgment"),
+    "JUDGMENT/SENTENCE": ("judgment", "Judgment"),
+    "CC COURT JUDGMENT": ("judgment", "Judgment"),
+    "RPO FINAL JUDGMENT": ("judgment", "Judgment"),
+    "VA FINAL JUDGMENT": ("judgment", "Judgment"),
+    "LIEN": ("lien", "Lien"),
+    "PROBATE": ("probate", "Probate Document"),
+    "NOTICE COMMENCEMENT": ("construction", "Notice of Commencement"),
+    "SATISFACTION": ("release", "Satisfaction / Release"),
+    "RELEASE": ("release", "Satisfaction / Release"),
+    "CANCELLATION": ("release", "Satisfaction / Release"),
+    "PARTIAL RELEASE": ("release", "Satisfaction / Release"),
+}
+
+# For most of these doc types, "DirectName" is the party FILING the
+# document -- a bank, HOA, debt collector, or the IRS -- not the property
+# owner. The actual distressed owner is the OTHER party. Only two
+# categories have the owner as DirectName: NOTICE COMMENCEMENT (the
+# property owner hires a contractor and files the notice themselves) and
+# PROBATE (DirectName is conventionally the decedent, e.g.
+# "SMITH JOHN DECEASED", whose estate owns the property).
+OWNER_FIELD_BY_CAT = {
+    "foreclosure": "IndirectName",   # plaintiff (bank) files against defendant (owner)
+    "tax": "IndirectName",           # tax collector notices the delinquent owner
+    "judgment": "IndirectName",      # creditor vs. debtor
+    "lien": "IndirectName",          # lienholder vs. debtor
+    "release": "IndirectName",       # lienholder releasing debtor's lien
+    "probate": "DirectName",         # decedent
+    "construction": "DirectName",    # owner notices their own contractor
+}
+
+
+def start_or_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    s.get(OR_BASE + "/", timeout=20)
+    s.post(OR_BASE + "/search/Disclaimer", data={"Disclaimer": "true"}, timeout=20).raise_for_status()
+    return s
+
+
+def fetch_records_for_day(session, date):
+    date_str = f"{date.month}/{date.day}/{date.year}"
+    session.get(OR_BASE + "/search/SearchTypeRecordDate", timeout=20)
+    session.post(
+        OR_BASE + "/search/SearchTypeRecordDate",
+        params={"Length": 6},
+        data={"RecordDate": date_str},
+        timeout=20,
+    ).raise_for_status()
+    resp = session.post(
+        OR_BASE + "/Search/GridResults",
+        headers={"X-Requested-With": "XMLHttpRequest"},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json().get("Data", [])
+
+
+def fetch_distress_records(days_back, delay=1.0):
+    session = start_or_session()
+    today = datetime.date.today()
+    out = []
+    for i in range(days_back):
+        d = today - datetime.timedelta(days=i)
+        print(f"[records] Fetching {d.strftime('%m/%d/%Y')} ...")
+        try:
+            rows = fetch_records_for_day(session, d)
+        except Exception as e:
+            print(f"  !! failed: {e}")
+            rows = []
+        kept = [r for r in rows if (r.get("DocTypeDescription") or "").upper() in CATEGORY_MAP]
+        print(f"  -> {len(rows)} total, {len(kept)} in tracked categories")
+        out.extend(kept)
+        time.sleep(delay)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tax deed auction (duval.realtaxdeed.com)
+# ---------------------------------------------------------------------------
+
+TD_BASE = "https://duval.realtaxdeed.com"
+
+
+def new_taxdeed_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    s.get(TD_BASE + "/", timeout=20)
+    return s
+
+
+def get_next_auction_date(session):
+    """Scrape the auction calendar and return the next scheduled tax deed
+    sale date (MM/DD/YYYY), or None if nothing is scheduled soon.
+
+    Calendar day cells with a scheduled auction carry a `dayid='MM/DD/YYYY'`
+    attribute (days with nothing scheduled have no dayid at all) -- the
+    click that opens the auction is handled by client-side JS, not a plain
+    href, so we read the attribute directly rather than looking for a link.
+    Only checks the currently-displayed month; if nothing is scheduled this
+    month, returns None rather than paging forward to the next one."""
+    r = session.get(
+        TD_BASE + "/index.cfm",
+        params={"zaction": "USER", "zmethod": "CALENDAR"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    dates = re.findall(r"dayid='(\d{2}/\d{2}/\d{4})'", r.text)
+    today = datetime.date.today()
+    for d in dates:
+        dt = datetime.datetime.strptime(d, "%m/%d/%Y").date()
+        if dt >= today:
+            return d
+    return None
+
+
+def set_auction_date(session, date_str):
+    session.get(
+        TD_BASE + "/index.cfm",
+        params={"zaction": "AUCTION", "Zmethod": "PREVIEW", "AUCTIONDATE": date_str},
+        timeout=20,
+    ).raise_for_status()
+
+
+def load_taxdeed_page(session, page_dir):
+    ts = int(time.time() * 1000)
+    r = session.get(
+        TD_BASE + "/index.cfm",
+        params={
+            "zaction": "AUCTION", "Zmethod": "UPDATE", "FNC": "LOAD", "AREA": "C",
+            "PageDir": page_dir, "doR": 1, "tx": ts, "bypassPage": 0, "test": 1, "_": ts,
+        },
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def taxdeed_field(label, block):
+    m = re.search(re.escape(label) + r'.*?CAD_DTA">\s*([^@]*)@G', block, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def parse_taxdeed_items(ret_html, auction_date):
+    blocks = re.split(r'(?=<div id="AITEM_\d+")', ret_html)
+    items = []
+    for block in blocks:
+        m = re.match(r'<div id="AITEM_(\d+)"', block)
+        if not m:
+            continue
+        parcel_m = re.search(
+            r'Parcel ID:.*?CAD_DTA">\s*<a href="([^"]*)"[^>]*>([^<]*)</a>', block, re.S
+        )
+        parcel_href = parcel_m.group(1) if parcel_m else ""
+        parcel_id = parcel_m.group(2).strip() if parcel_m else taxdeed_field("Parcel ID:", block)
+
+        addr_m = re.search(
+            r'Property Address:.*?CAD_DTA">\s*([^@]*)@G(.*?)Assessed Value:', block, re.S
+        )
+        property_address = addr_m.group(1).strip() if addr_m else ""
+        city_state_zip = ""
+        if addr_m:
+            csz_m = re.search(r'CAD_DTA">\s*([^@]*)@G', addr_m.group(2), re.S)
+            city_state_zip = csz_m.group(1).strip() if csz_m else ""
+
+        items.append({
+            "auction_date": auction_date,
+            "case_number": taxdeed_field("Case #:", block),
+            "opening_bid": taxdeed_field("Opening Bid:", block),
+            "parcel_id": parcel_id,
+            "parcel_appraiser_url": parcel_href,
+            "property_address": property_address,
+            "city_state_zip": city_state_zip,
+            "assessed_value": taxdeed_field("Assessed Value:", block),
+        })
+    return items
+
+
+def fetch_taxdeed_auction(date_str, delay=0.5, max_pages=200):
+    session = new_taxdeed_session()
+    set_auction_date(session, date_str)
+    seen, all_items, page_dir = set(), [], 0
+    for _ in range(max_pages):
+        data = load_taxdeed_page(session, page_dir)
+        items = parse_taxdeed_items(data.get("retHTML", ""), date_str)
+        new_items = [it for it in items if it["parcel_id"] not in seen]
+        if not new_items:
+            break
+        for it in new_items:
+            seen.add(it["parcel_id"])
+        all_items.extend(new_items)
+        page_dir = 1
+        time.sleep(delay)
+    return all_items
+
+
+# ---------------------------------------------------------------------------
+# Property Appraiser enrichment (paopropertysearch.coj.net)
+# ---------------------------------------------------------------------------
+
+PAO_BASE = "https://paopropertysearch.coj.net"
+
+STOPWORDS = {
+    "PT", "SEC", "PH", "PHASE", "UNIT", "U", "NO", "AND", "THE",
+    "OF", "SUBD", "SD", "REPLAT", "ADDN", "ADDITION", "EST", "ESTATES",
+}
+NUMBER_WORDS = {
+    "ONE": "1", "TWO": "2", "THREE": "3", "FOUR": "4", "FIVE": "5",
+    "SIX": "6", "SEVEN": "7", "EIGHT": "8", "NINE": "9", "TEN": "10",
+    "ELEVEN": "11", "TWELVE": "12",
+}
+ENTITY_PATTERN = re.compile(
+    r"LAND\s*TRUST|\bLLC\b|\bL\.L\.C\.?\b|\bINC\.?\b|\bCORP(?:ORATION)?\.?\b|"
+    r"\bLP\b|\bLLP\b|\bLTD\.?\b|\bCOMPANY\b|\bHOLDINGS\b|\bENTERPRISES\b|"
+    r"\bINVESTMENTS?\s*(GROUP)?\b|\bPROPERTIES\b|\bCAPITAL\b|\bVENTURES?\b",
+    re.I,
+)
+
+
+def new_pao_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+def get_hidden_fields(html):
+    fields = {}
+    for name in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__PREVIOUSPAGE", "__EVENTVALIDATION"):
+        m = re.search(rf'id="{name}" value="([^"]*)"', html)
+        fields[name] = m.group(1) if m else ""
+    return fields
+
+
+def normalize_tokens(text):
+    text = (text or "").upper()
+    text = re.sub(r"^\s*\d{3,6}\s+", " ", text)
+    text = re.sub(r"\bPT\b", " ", text)
+    text = re.sub(r"\bLOTS?\.?\s*\d+\b", " ", text)
+    text = re.sub(r"\bL\.?\s*\d+\b", " ", text)
+    text = re.sub(r"\bBLOCKS?\.?\s*\d+\b", " ", text)
+    text = re.sub(r"\bBLK\.?\s*\d+\b", " ", text)
+    text = re.sub(r"\bB\.?\s*\d+\b", " ", text)
+    text = re.sub(r"\bSEC\.?\s*\d+[-\s]+\d+[NSEW]?[-\s]+\d+[NSEW]?\b", " ", text)
+    text = re.sub(r"&\s*C\b", " ", text)
+    text = re.sub(r"[^A-Z0-9 ]", " ", text)
+    tokens = set()
+    for raw in text.split():
+        t = NUMBER_WORDS.get(raw, raw)
+        if t in STOPWORDS:
+            continue
+        if t.isdigit():
+            tokens.add(str(int(t)))
+            continue
+        if len(t) < 3:
+            continue
+        tokens.add(t)
+    return tokens
+
+
+def jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def search_owner(session, name, results_per_page="2000"):
+    r = session.get(PAO_BASE + "/Basic/Search.aspx", timeout=20)
+    r.raise_for_status()
+    hidden = get_hidden_fields(r.text)
+    data = {
+        "__LASTFOCUS": "", "__EVENTTARGET": "", "__EVENTARGUMENT": "",
+        "__VIEWSTATE": hidden["__VIEWSTATE"],
+        "__VIEWSTATEGENERATOR": hidden["__VIEWSTATEGENERATOR"],
+        "__PREVIOUSPAGE": hidden["__PREVIOUSPAGE"],
+        "__EVENTVALIDATION": hidden["__EVENTVALIDATION"],
+        "ctl00$cphBody$tbRE6": "", "ctl00$cphBody$tbRE4": "",
+        "ctl00$cphBody$tbName": name,
+        "ctl00$cphBody$tbStreetNumber": "", "ctl00$cphBody$tbStreetName": "",
+        "ctl00$cphBody$ddStreetSuffix": "", "ctl00$cphBody$ddStreetPrefix": "",
+        "ctl00$cphBody$tbStreetUnit": "", "ctl00$cphBody$ddCity": "",
+        "ctl00$cphBody$tbZipCode": "", "ctl00$cphBody$ddSearchType": "All",
+        "ctl00$cphBody$ddResultsPerPage": results_per_page,
+        "ctl00$cphBody$bSearch": "Search",
+    }
+    r2 = session.post(PAO_BASE + "/Basic/Results.aspx", data=data, timeout=30)
+    r2.raise_for_status()
+    soup = BeautifulSoup(r2.text, "html.parser")
+    table = soup.find("table", id="ctl00_cphBody_gridResults")
+    if table is None:
+        return []
+    results = []
+    for row in table.find_all("tr")[1:]:
+        cells = row.find_all("td")
+        if len(cells) < 9:
+            continue
+        re_link = cells[0].find("a")
+        re_raw = re_link["href"].split("RE=")[-1] if re_link and "RE=" in re_link.get("href", "") else ""
+        street_parts = [cells[2].get_text(strip=True), cells[3].get_text(strip=True),
+                        cells[4].get_text(strip=True), cells[5].get_text(strip=True)]
+        situs_address = " ".join(p for p in street_parts if p and p != "\xa0")
+        unit = cells[6].get_text(strip=True)
+        if unit and unit != "\xa0":
+            situs_address += f" UNIT {unit}"
+        results.append({
+            "re_number": cells[0].get_text(strip=True),
+            "re_raw": re_raw,
+            "situs_address": situs_address,
+            "situs_city": cells[7].get_text(strip=True),
+            "situs_zip": cells[8].get_text(strip=True),
+        })
+    return results
+
+
+def get_detail(session, re_raw):
+    r = session.get(PAO_BASE + f"/Basic/Detail.aspx?RE={re_raw}", timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    def text(id_):
+        el = soup.find(id=id_)
+        return el.get_text(strip=True) if el else ""
+
+    subdivision = ""
+    sub_label = soup.find(string=re.compile(r"^\s*Subdivision\s*$"))
+    if sub_label:
+        row = sub_label.find_parent("tr")
+        if row:
+            cells = row.find_all("td")
+            if cells:
+                subdivision = cells[-1].get_text(strip=True)
+
+    mailing_name = text("ctl00_cphBody_repeaterOwnerInformation_ctl00_lblOwnerName")
+    raw_lines = [
+        text("ctl00_cphBody_repeaterOwnerInformation_ctl00_lblMailingAddressLine1"),
+        text("ctl00_cphBody_repeaterOwnerInformation_ctl00_lblMailingAddressLine2"),
+        text("ctl00_cphBody_repeaterOwnerInformation_ctl00_lblMailingAddressLine3"),
+    ]
+    lines = [l for l in raw_lines if l]
+    # The last non-empty line is always city/state/zip; everything before
+    # it is the mailing address itself (which can be two lines, e.g. a
+    # "C/O ..." line followed by the actual street).
+    if len(lines) >= 2:
+        mailing_address = ", ".join(lines[:-1])
+        mailing_csz = lines[-1]
+    elif len(lines) == 1:
+        mailing_address = ""
+        mailing_csz = lines[0]
+    else:
+        mailing_address = ""
+        mailing_csz = ""
+
+    return {
+        "subdivision": subdivision,
+        "mailing_name": mailing_name,
+        "mailing_address": mailing_address,
+        "mailing_city_state_zip": mailing_csz,
+    }
+
+
+def resolve_owner(session, name, legal_desc, max_detail_scan=40, delay=0.4):
+    candidates = search_owner(session, name)
+    time.sleep(delay)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        detail = {}
+        try:
+            detail = get_detail(session, candidates[0]["re_raw"])
+        except Exception:
+            pass
+        time.sleep(delay)
+        return {**candidates[0], **detail}
+
+    deed_tokens = normalize_tokens(legal_desc)
+    scan = candidates[:max_detail_scan]
+    scored = []
+    for c in scan:
+        try:
+            detail = get_detail(session, c["re_raw"])
+        except Exception:
+            detail = {}
+        time.sleep(delay)
+        merged = {**c, **detail}
+        score = jaccard(deed_tokens, normalize_tokens(merged.get("subdivision", "")))
+        scored.append((score, merged))
+    scored.sort(key=lambda x: -x[0])
+    return scored[0][1]
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+BASE_SCORE = {
+    "foreclosure": 70,
+    "tax": 70,
+    "judgment": 45,
+    "lien": 35,
+    "probate": 55,
+    "construction": 15,
+    "release": 5,
+}
+
+
+def parse_city_state_zip(csz):
+    """Split 'JACKSONVILLE, FL 32218-2857' (or a trailing-dash zip with no
+    +4, e.g. '32244-') into (city, state, zip)."""
+    if not csz:
+        return "", "", ""
+    m = re.match(r"^\s*(.*?),\s*([A-Z]{2})\s*([\d-]*)\s*$", csz.upper())
+    if not m:
+        return csz.strip(), "", ""
+    city, state, zip_ = m.groups()
+    return city.strip().title(), state, zip_.rstrip("-")
+
+
+def street_norm(addr):
+    s = (addr or "").upper()
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    repl = {"ROAD": "RD", "STREET": "ST", "AVENUE": "AVE", "DRIVE": "DR", "LANE": "LN",
+            "COURT": "CT", "CIRCLE": "CIR", "BOULEVARD": "BLVD", "PLACE": "PL",
+            "TERRACE": "TER", "TRAIL": "TRL", "PARKWAY": "PKWY", "HIGHWAY": "HWY"}
+    words = [repl.get(w, w) for w in s.split()]
+    return " ".join(words)
+
+
+def compute_score_flags(cat, filed_date, owner_name, prop_address, mail_address, is_multi_party):
+    score = BASE_SCORE.get(cat, 20)
+    flags = []
+
+    if filed_date:
+        try:
+            fdt = datetime.datetime.strptime(filed_date, "%Y-%m-%d").date()
+            if (datetime.date.today() - fdt).days <= 7:
+                flags.append("New this week")
+                score += 10
+        except ValueError:
+            pass
+
+    if ENTITY_PATTERN.search(owner_name or ""):
+        flags.append("LLC / corp owner")
+
+    if prop_address and mail_address:
+        p, m = street_norm(prop_address), street_norm(mail_address)
+        if p and p not in m:
+            flags.append("Absentee owner")
+            score += 15
+
+    if is_multi_party:
+        flags.append("Multiple parties")
+        score += 10
+
+    return min(score, 100), flags
+
+
+# ---------------------------------------------------------------------------
+# Assembly
+# ---------------------------------------------------------------------------
+
+
+def build_records(days_back, delay_records, delay_pao, max_detail_scan):
+    session = new_pao_session()
+    records = []
+
+    # -- Official Records --
+    raw = fetch_distress_records(days_back, delay=delay_records)
+    print(f"[records] {len(raw)} distress-category official records to enrich")
+    cache = {}
+    for i, r in enumerate(raw, 1):
+        cat, cat_label = CATEGORY_MAP.get((r.get("DocTypeDescription") or "").upper(), ("other", r.get("DocTypeDescription", "")))
+        owner_field = OWNER_FIELD_BY_CAT.get(cat, "DirectName")
+        other_field = "IndirectName" if owner_field == "DirectName" else "DirectName"
+
+        name = r.get(owner_field, "")
+        legal = r.get("DocLegalDescription", "")
+        if name not in cache:
+            print(f"[pao {i}/{len(raw)}] ({cat}) {name}")
+            cache[name] = resolve_owner(session, name, legal, max_detail_scan, delay_pao)
+        match = cache[name] or {}
+
+        owner_full = name
+        other_party = r.get(other_field, "")
+        filed = r.get("RecordDate", "").replace("/", "-")
+        is_multi = " GRANTOR " in owner_full.upper() or len(owner_full.split("/")) > 1
+
+        prop_address = match.get("situs_address", "")
+        prop_city = match.get("situs_city", "")
+        mail_address = match.get("mailing_address", "")
+        mail_city, mail_state, mail_zip = parse_city_state_zip(match.get("mailing_city_state_zip", ""))
+
+        score, flags = compute_score_flags(cat, filed, owner_full, prop_address, mail_address, is_multi)
+
+        records.append({
+            "doc_num": r.get("InstrumentNumber", ""),
+            "doc_type": r.get("DocTypeDescription", ""),
+            "filed": filed,
+            "cat": cat,
+            "cat_label": cat_label,
+            "owner": owner_full,
+            "grantee": other_party,
+            "amount": None,
+            "legal": legal,
+            "prop_address": prop_address,
+            "prop_city": prop_city,
+            "prop_state": "FL",
+            "prop_zip": match.get("situs_zip", "").rstrip("-"),
+            "mail_address": mail_address,
+            "mail_city": mail_city,
+            "mail_state": mail_state,
+            "mail_zip": mail_zip,
+            "clerk_url": "https://or.duvalclerk.com/search/SearchTypeInstrumentNumber",
+            "flags": flags,
+            "score": score,
+            "source": "Duval County Clerk -- Official Records",
+        })
+
+    # -- Tax deed auction --
+    td_session = new_taxdeed_session()
+    auction_date = get_next_auction_date(td_session)
+    if auction_date:
+        print(f"[taxdeed] Next auction: {auction_date}")
+        items = fetch_taxdeed_auction(auction_date)
+        print(f"[taxdeed] {len(items)} items to enrich")
+        for i, item in enumerate(items, 1):
+            re_raw = item["parcel_id"].replace("-", "")
+            print(f"[pao {i}/{len(items)}] RE# {item['parcel_id']}")
+            detail = {}
+            if re_raw:
+                try:
+                    detail = get_detail(session, re_raw)
+                except Exception:
+                    pass
+                time.sleep(delay_pao)
+
+            owner_name = detail.get("mailing_name", "")
+            mail_address = detail.get("mailing_address", "")
+            mail_city, mail_state, mail_zip = parse_city_state_zip(detail.get("mailing_city_state_zip", ""))
+            score, flags = compute_score_flags(
+                "tax", None, owner_name, item["property_address"], mail_address, False
+            )
+            flags.append("Tax deed sale scheduled")
+
+            city = item["city_state_zip"].split(",")[0].strip() if "," in item["city_state_zip"] else ""
+            zipm = re.search(r"(\d{5})", item["city_state_zip"])
+
+            records.append({
+                "doc_num": item["case_number"],
+                "doc_type": "TAX DEED",
+                "filed": auction_date.replace("/", "-") if auction_date else "",
+                "cat": "tax",
+                "cat_label": "Tax Deed",
+                "owner": owner_name,
+                "grantee": "",
+                "amount": item["opening_bid"].replace("$", "").replace(",", "") or None,
+                "legal": "",
+                "prop_address": item["property_address"],
+                "prop_city": city,
+                "prop_state": "FL",
+                "prop_zip": zipm.group(1) if zipm else "",
+                "mail_address": mail_address,
+                "mail_city": mail_city,
+                "mail_state": mail_state,
+                "mail_zip": mail_zip,
+                "clerk_url": item["parcel_appraiser_url"],
+                "flags": flags,
+                "score": score,
+                "source": "Duval County Tax Deed Auction",
+            })
+
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build records.json for the Duval County lead tracker dashboard")
+    parser.add_argument("--days", type=int, default=7, help="Days of Official Records to pull (default 7)")
+    parser.add_argument("--records-delay", type=float, default=1.0)
+    parser.add_argument("--pao-delay", type=float, default=0.4)
+    parser.add_argument("--max-detail-scan", type=int, default=40)
+    parser.add_argument("--out", default="records.json")
+    args = parser.parse_args()
+
+    records = build_records(args.days, args.records_delay, args.pao_delay, args.max_detail_scan)
+
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=args.days - 1)
+    payload = {
+        "fetched_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source": "Duval County Clerk + Property Appraiser + Tax Deed Auction",
+        "date_range": {"from": start.isoformat(), "to": today.isoformat()},
+        "total": len(records),
+        "with_address": sum(1 for r in records if r.get("prop_address")),
+        "records": records,
+    }
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=None)
+
+    print(f"\nWrote {len(records)} records to {args.out}")
+
+
+if __name__ == "__main__":
+    main()
