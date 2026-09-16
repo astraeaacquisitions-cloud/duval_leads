@@ -286,6 +286,19 @@ ENTITY_PATTERN = re.compile(
     re.I,
 )
 
+# Duval's Official Records has no distinct "Code Violation" doc type --
+# code enforcement liens are just filed as generic LIEN. The only way to
+# separate them out is by WHO filed the lien: if the filer (the "grantee"
+# field for a lien record -- see OWNER_FIELD_BY_CAT) looks like a city/
+# county/code-enforcement entity rather than a bank, HOA, or contractor,
+# treat it as a likely code violation lien.
+MUNICIPAL_FILER_PATTERN = re.compile(
+    r"\bCITY OF\b|\bCONSOLIDATED CITY\b|\bCODE ENFORCEMENT\b|"
+    r"\bDUVAL COUNTY\b|\bCOUNTY OF DUVAL\b|\bMUNICIPAL\b|"
+    r"\bCITY OF JACKSONVILLE\b",
+    re.I,
+)
+
 
 def new_pao_session():
     s = requests.Session()
@@ -466,6 +479,7 @@ BASE_SCORE = {
     "tax": 70,
     "judgment": 45,
     "lien": 35,
+    "code_violation": 50,
     "probate": 55,
     "construction": 15,
     "release": 5,
@@ -553,12 +567,18 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
         filed = r.get("RecordDate", "").replace("/", "-")
         is_multi = " GRANTOR " in owner_full.upper() or len(owner_full.split("/")) > 1
 
+        is_code_violation = cat == "lien" and MUNICIPAL_FILER_PATTERN.search(other_party or "")
+        if is_code_violation:
+            cat, cat_label = "code_violation", "Possible Code Violation Lien"
+
         prop_address = match.get("situs_address", "")
         prop_city = match.get("situs_city", "")
         mail_address = match.get("mailing_address", "")
         mail_city, mail_state, mail_zip = parse_city_state_zip(match.get("mailing_city_state_zip", ""))
 
         score, flags = compute_score_flags(cat, filed, owner_full, prop_address, mail_address, is_multi)
+        if is_code_violation:
+            flags.append("Filed by city/county")
 
         records.append({
             "doc_num": r.get("InstrumentNumber", ""),
