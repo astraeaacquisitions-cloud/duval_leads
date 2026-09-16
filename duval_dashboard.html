@@ -18,6 +18,7 @@
   --crit:      #a63d3d;
   --purple:    #7a5ea8;
   --blue:      #3f6f95;
+  --slate:     #5a6a78;
   --shadow:    0 1px 2px #22140b14, 0 8px 24px -12px #22140b2e;
   --radius:    3px;
   --display:   'Fraunces', Georgia, serif;
@@ -41,6 +42,7 @@
     --crit:      #e07272;
     --purple:    #ab93d6;
     --blue:      #7bacd6;
+    --slate:     #9fb0bd;
     --shadow:    0 1px 2px #0006, 0 12px 28px -14px #000a;
   }
 }
@@ -60,6 +62,7 @@
   --crit:      #e07272;
   --purple:    #ab93d6;
   --blue:      #7bacd6;
+  --slate:     #9fb0bd;
   --shadow:    0 1px 2px #0006, 0 12px 28px -14px #000a;
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -204,6 +207,7 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
 .cat-probate{border-color:var(--blue);color:var(--blue);background:color-mix(in srgb, var(--blue) 10%, transparent)}
 .cat-construction{border-color:var(--good);color:var(--good);background:color-mix(in srgb, var(--good) 10%, transparent)}
 .cat-release{border-color:var(--muted);color:var(--muted);background:color-mix(in srgb, var(--muted) 10%, transparent)}
+.cat-code_violation{border-color:var(--slate);color:var(--slate);background:color-mix(in srgb, var(--slate) 10%, transparent)}
 .cat-other{border-color:var(--muted);color:var(--muted);background:color-mix(in srgb, var(--muted) 10%, transparent)}
 
 .flag-pill{
@@ -311,6 +315,7 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
       <option value="tax">Tax Deed</option>
       <option value="judgment">Judgment</option>
       <option value="lien">Lien</option>
+      <option value="code_violation">Possible Code Violation</option>
       <option value="probate">Probate</option>
       <option value="construction">Notice of Commencement</option>
       <option value="release">Satisfaction / Release</option>
@@ -401,7 +406,7 @@ function buildStats(recs){
   const addr = recs.filter(r=>r.prop_address).length;
   const avg  = recs.length ? (recs.reduce((a,r)=>a+r.score,0)/recs.length).toFixed(1) : 0;
   const fc   = recs.filter(r=>["foreclosure","tax"].includes(r.cat)).length;
-  const lien = recs.filter(r=>["lien","judgment"].includes(r.cat)).length;
+  const lien = recs.filter(r=>["lien","judgment","code_violation"].includes(r.cat)).length;
   document.getElementById("s-total").textContent = recs.length.toLocaleString();
   document.getElementById("s-hot").textContent   = hot.toLocaleString();
   document.getElementById("s-addr").textContent  = addr.toLocaleString();
