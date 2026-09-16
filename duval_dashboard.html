@@ -1,0 +1,612 @@
+<title>Duval County Docket</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700;9..144,800&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+<style>
+:root{
+  --bg:        #f6f1e6;
+  --bg2:       #ffffff;
+  --bg3:       #efe8d6;
+  --border:    #ddd2b4;
+  --border2:   #c9bb92;
+  --accent:    #a15a1f;
+  --accent-ink:#ffffff;
+  --text:      #221c14;
+  --muted:     #7a6f57;
+  --muted2:    #4f4634;
+  --good:      #2f7a4f;
+  --warn:      #b1791f;
+  --crit:      #a63d3d;
+  --purple:    #7a5ea8;
+  --blue:      #3f6f95;
+  --shadow:    0 1px 2px #22140b14, 0 8px 24px -12px #22140b2e;
+  --radius:    3px;
+  --display:   'Fraunces', Georgia, serif;
+  --sans:      'Public Sans', system-ui, sans-serif;
+  --mono:      'IBM Plex Mono', ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:        #10161a;
+    --bg2:       #161e23;
+    --bg3:       #1c262c;
+    --border:    #263138;
+    --border2:   #354048;
+    --accent:    #d29a4e;
+    --accent-ink:#1a1206;
+    --text:      #ecebe4;
+    --muted:     #8b98a0;
+    --muted2:    #b9c2c8;
+    --good:      #57b57e;
+    --warn:      #d9a844;
+    --crit:      #e07272;
+    --purple:    #ab93d6;
+    --blue:      #7bacd6;
+    --shadow:    0 1px 2px #0006, 0 12px 28px -14px #000a;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:        #10161a;
+  --bg2:       #161e23;
+  --bg3:       #1c262c;
+  --border:    #263138;
+  --border2:   #354048;
+  --accent:    #d29a4e;
+  --accent-ink:#1a1206;
+  --text:      #ecebe4;
+  --muted:     #8b98a0;
+  --muted2:    #b9c2c8;
+  --good:      #57b57e;
+  --warn:      #d9a844;
+  --crit:      #e07272;
+  --purple:    #ab93d6;
+  --blue:      #7bacd6;
+  --shadow:    0 1px 2px #0006, 0 12px 28px -14px #000a;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--sans);
+  font-size:14px;
+  line-height:1.55;
+  padding-inline:20px;
+  padding-block:0 32px;
+}
+.shell{max-width:1360px;margin:0 auto}
+
+/* ── Masthead ─────────────────────────────────────── */
+.masthead{
+  display:flex;align-items:flex-end;justify-content:space-between;
+  gap:16px;flex-wrap:wrap;
+  padding-block:24px 16px;
+  border-bottom:3px double var(--border2);
+}
+.wordmark{display:flex;align-items:baseline;gap:10px}
+.wordmark .county{
+  font-family:var(--display);font-weight:600;font-size:13px;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
+}
+.wordmark h1{
+  font-family:var(--display);font-weight:700;font-size:30px;
+  letter-spacing:-.01em;
+}
+.wordmark h1 em{font-style:normal;color:var(--accent)}
+.meta-line{
+  font-family:var(--mono);font-size:11.5px;color:var(--muted);
+  display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+}
+.meta-line .pulse{width:7px;height:7px;border-radius:50%;background:var(--good);
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--good) 20%, transparent);
+  animation:beat 2.2s infinite;flex-shrink:0}
+@keyframes beat{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* ── Stat rail ────────────────────────────────────── */
+.stat-rail{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  gap:1px;background:var(--border);
+  border:1px solid var(--border);border-radius:var(--radius);
+  overflow:hidden;margin-block:18px;
+}
+.stat{
+  background:var(--bg2);padding:14px 16px;display:flex;flex-direction:column;gap:3px;
+}
+.stat .n{font-family:var(--display);font-weight:700;font-size:25px;font-variant-numeric:tabular-nums}
+.stat .l{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.stat.hot .n{color:var(--crit)}
+
+/* ── Chart strip ──────────────────────────────────── */
+.chart-strip{
+  display:grid;grid-template-columns:1.4fr 1fr;gap:14px;margin-block:0 18px;
+}
+@media(max-width:760px){.chart-strip{grid-template-columns:1fr}}
+.panel{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);
+  padding:14px 16px;box-shadow:var(--shadow);
+}
+.panel h3{
+  font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--muted);margin-bottom:12px;
+}
+.bar-row{display:flex;align-items:center;gap:9px;margin-block-end:7px}
+.bar-row:last-child{margin-block-end:0}
+.bar-label{font-size:11.5px;color:var(--muted2);width:150px;flex-shrink:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-track{flex:1;height:9px;background:var(--bg3);border-radius:2px;overflow:hidden}
+.bar-fill{height:100%;background:var(--accent);border-radius:2px}
+.bar-count{font-family:var(--mono);font-size:11px;color:var(--muted2);width:34px;text-align:right}
+
+.dist-row{display:flex;justify-content:space-between;align-items:center;padding-block:6px;
+  border-bottom:1px dashed var(--border)}
+.dist-row:last-child{border-bottom:none}
+.dist-swatch{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:8px}
+.dist-name{font-size:12px;color:var(--muted2)}
+.dist-val{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums}
+
+/* ── Toolbar ──────────────────────────────────────── */
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-block-end:12px}
+.search-wrap{position:relative;flex:1;min-width:200px;max-width:340px}
+.search-wrap svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--muted)}
+input[type=search]{
+  width:100%;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--radius);
+  padding:7px 10px 7px 30px;color:var(--text);font-family:var(--sans);font-size:12.5px;
+}
+input[type=search]:focus{outline:2px solid var(--accent);outline-offset:-1px}
+select,button.chip{
+  background:var(--bg2);border:1px solid var(--border2);border-radius:var(--radius);
+  padding:7px 11px;color:var(--text);font-family:var(--sans);font-size:12.5px;cursor:pointer;
+}
+button.chip.active{border-color:var(--accent);color:var(--accent);background:color-mix(in srgb, var(--accent) 12%, var(--bg2))}
+.spacer{flex:1}
+.btn-primary{
+  background:var(--accent);color:var(--accent-ink);border:none;border-radius:var(--radius);
+  padding:8px 16px;font-family:var(--display);font-weight:700;font-size:12px;
+  letter-spacing:.03em;cursor:pointer;
+}
+.btn-primary:hover{filter:brightness(1.08)}
+
+/* ── Table ────────────────────────────────────────── */
+.table-wrap{border:1px solid var(--border);border-radius:var(--radius);background:var(--bg2);
+  overflow-x:auto;box-shadow:var(--shadow)}
+table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:820px}
+thead th{
+  background:var(--bg3);padding:9px 12px;text-align:left;font-family:var(--mono);
+  font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
+  border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none;
+}
+thead th:hover{color:var(--accent)}
+thead th.sorted{color:var(--accent)}
+tbody tr{border-bottom:1px solid var(--border);cursor:pointer}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--bg3)}
+td{padding:9px 12px;vertical-align:top}
+td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nums}
+.owner-cell{font-weight:600;max-width:190px}
+.owner-cell .sub{font-size:10.5px;color:var(--muted);font-weight:400;margin-top:2px}
+.addr-cell{max-width:210px;font-size:11.5px;color:var(--muted2)}
+
+.seal{
+  width:38px;height:38px;border-radius:50%;display:grid;place-items:center;
+  font-family:var(--mono);font-weight:600;font-size:12px;border:2px solid;flex-shrink:0;
+}
+.seal.s-crit{border-color:var(--crit);color:var(--crit);background:color-mix(in srgb, var(--crit) 12%, transparent)}
+.seal.s-warn{border-color:var(--warn);color:var(--warn);background:color-mix(in srgb, var(--warn) 12%, transparent)}
+.seal.s-good{border-color:var(--muted);color:var(--muted);background:transparent}
+
+.tab{
+  display:inline-flex;align-items:center;font-family:var(--mono);font-size:9.5px;
+  padding:2px 6px;border-radius:2px;text-transform:uppercase;letter-spacing:.04em;
+  border-left:3px solid;white-space:nowrap;
+}
+.cat-foreclosure{border-color:var(--crit);color:var(--crit);background:color-mix(in srgb, var(--crit) 10%, transparent)}
+.cat-tax{border-color:var(--warn);color:var(--warn);background:color-mix(in srgb, var(--warn) 10%, transparent)}
+.cat-judgment{border-color:var(--accent);color:var(--accent);background:color-mix(in srgb, var(--accent) 10%, transparent)}
+.cat-lien{border-color:var(--purple);color:var(--purple);background:color-mix(in srgb, var(--purple) 10%, transparent)}
+.cat-probate{border-color:var(--blue);color:var(--blue);background:color-mix(in srgb, var(--blue) 10%, transparent)}
+.cat-construction{border-color:var(--good);color:var(--good);background:color-mix(in srgb, var(--good) 10%, transparent)}
+.cat-release{border-color:var(--muted);color:var(--muted);background:color-mix(in srgb, var(--muted) 10%, transparent)}
+.cat-other{border-color:var(--muted);color:var(--muted);background:color-mix(in srgb, var(--muted) 10%, transparent)}
+
+.flag-pill{
+  display:inline-flex;align-items:center;font-size:9.5px;padding:2px 7px;border-radius:20px;
+  background:var(--bg3);border:1px solid var(--border2);color:var(--muted2);white-space:nowrap;
+}
+.no-data{text-align:center;padding:50px 20px;color:var(--muted);font-family:var(--mono);font-size:12.5px}
+
+/* ── Pagination ───────────────────────────────────── */
+.pagination{display:flex;align-items:center;gap:6px;padding-block:12px;justify-content:flex-end}
+.page-btn{
+  background:var(--bg2);border:1px solid var(--border2);border-radius:2px;padding:4px 9px;
+  color:var(--text);font-family:var(--mono);font-size:11.5px;cursor:pointer;
+}
+.page-btn.active,.page-btn:hover{border-color:var(--accent);color:var(--accent)}
+.page-btn:disabled{opacity:.35;cursor:default}
+.page-info{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-right:2px}
+
+/* ── Modal ────────────────────────────────────────── */
+.modal-bg{
+  display:none;position:fixed;inset:0;background:#1a120acc;z-index:100;
+  align-items:center;justify-content:center;padding:20px;
+}
+.modal-bg.open{display:flex}
+.modal{
+  background:var(--bg2);border:1px solid var(--border2);border-radius:6px;
+  max-width:640px;width:100%;max-height:88vh;overflow-y:auto;padding:26px;position:relative;
+  box-shadow:0 24px 60px -20px #000a;
+}
+.modal-close{
+  position:absolute;top:14px;right:14px;background:none;border:none;color:var(--muted);
+  font-size:19px;cursor:pointer;width:26px;height:26px;
+}
+.modal-close:hover{color:var(--text)}
+.modal-seal{
+  width:60px;height:60px;border-radius:50%;display:grid;place-items:center;
+  font-family:var(--mono);font-weight:600;font-size:20px;border:3px solid;margin-bottom:14px;
+}
+.modal-title{font-family:var(--display);font-weight:700;font-size:19px;margin-bottom:18px;padding-right:30px}
+.dgrid{display:grid;grid-template-columns:1fr 1fr;gap:11px 22px;margin-bottom:16px}
+@media(max-width:480px){.dgrid{grid-template-columns:1fr}}
+.ditem label{display:block;font-size:9.5px;font-family:var(--mono);text-transform:uppercase;
+  letter-spacing:.08em;color:var(--muted);margin-bottom:3px}
+.ditem .v{font-size:12.5px}
+.msection{border-top:1px solid var(--border);padding-top:13px;margin-top:13px}
+.msection h4{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--muted);margin-bottom:8px}
+.flags-wrap{display:flex;flex-wrap:wrap;gap:6px}
+.modal-link{
+  display:inline-flex;align-items:center;gap:5px;color:var(--accent);text-decoration:none;
+  font-family:var(--mono);font-size:11.5px;border:1px solid var(--accent);border-radius:3px;
+  padding:6px 11px;margin-top:6px;
+}
+.modal-link:hover{background:color-mix(in srgb, var(--accent) 12%, transparent)}
+
+.footnote{font-size:11px;color:var(--muted);margin-block-start:18px;line-height:1.6}
+.footnote a{color:var(--accent)}
+</style>
+
+<div class="shell">
+
+  <header class="masthead">
+    <div class="wordmark">
+      <span class="county">Duval County</span>
+      <h1>Distress <em>Docket</em></h1>
+    </div>
+    <div class="meta-line">
+      <span class="pulse"></span>
+      <span id="meta-updated">Loading…</span>
+      <span>·</span>
+      <span id="meta-range"></span>
+    </div>
+  </header>
+
+  <div class="stat-rail" id="stat-rail">
+    <div class="stat"><div class="n" id="s-total">–</div><div class="l">Total Leads</div></div>
+    <div class="stat hot"><div class="n" id="s-hot">–</div><div class="l">Hot (Score ≥ 70)</div></div>
+    <div class="stat"><div class="n" id="s-addr">–</div><div class="l">With Address</div></div>
+    <div class="stat"><div class="n" id="s-avg">–</div><div class="l">Avg Score</div></div>
+    <div class="stat"><div class="n" id="s-fc">–</div><div class="l">Foreclosure / Tax</div></div>
+    <div class="stat"><div class="n" id="s-lien">–</div><div class="l">Liens / Judgments</div></div>
+  </div>
+
+  <div class="chart-strip">
+    <div class="panel">
+      <h3>Filings by Type</h3>
+      <div id="type-chart"></div>
+    </div>
+    <div class="panel">
+      <h3>Score Distribution</h3>
+      <div id="score-dist"></div>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <div class="search-wrap">
+      <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+      </svg>
+      <input type="search" id="search-input" placeholder="Search owner, doc #, address…"/>
+    </div>
+    <select id="cat-filter">
+      <option value="">All Categories</option>
+      <option value="foreclosure">Foreclosure / Lis Pendens</option>
+      <option value="tax">Tax Deed</option>
+      <option value="judgment">Judgment</option>
+      <option value="lien">Lien</option>
+      <option value="probate">Probate</option>
+      <option value="construction">Notice of Commencement</option>
+      <option value="release">Satisfaction / Release</option>
+    </select>
+    <select id="score-filter">
+      <option value="0">All Scores</option>
+      <option value="70">Hot ≥ 70</option>
+      <option value="50">Warm ≥ 50</option>
+    </select>
+    <button class="chip" id="addr-filter">Has Address</button>
+    <div class="spacer"></div>
+    <button class="btn-primary" id="export-csv-btn">⇩ Export CSV</button>
+  </div>
+
+  <div class="table-wrap">
+    <table id="leads-table">
+      <thead>
+        <tr>
+          <th data-col="score">Score</th>
+          <th data-col="cat_label">Type</th>
+          <th data-col="doc_num">Doc #</th>
+          <th data-col="filed">Filed</th>
+          <th data-col="owner">Owner</th>
+          <th data-col="prop_address">Property Address</th>
+          <th data-col="amount">Amount</th>
+          <th>Flags</th>
+          <th>Record</th>
+        </tr>
+      </thead>
+      <tbody id="leads-body"><tr><td colspan="9" class="no-data">Loading records…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="pagination" id="pagination"></div>
+
+  <p class="footnote">
+    Sources: Duval County Clerk of Courts (Official Records) and the Duval County Tax Deed Auction
+    (RealAuction). Property and mailing addresses cross-referenced against the Duval County Property
+    Appraiser. Scores are a heuristic ranking, not a legal or financial assessment — verify every
+    record before acting on it. Neither clerk system exposes a public deep link to the scanned
+    document image; the "Record" links go to the relevant public search page or, for tax-deed
+    items, straight to the parcel's Property Appraiser record.
+  </p>
+
+</div>
+
+<div class="modal-bg" id="modal-bg">
+  <div class="modal" id="modal">
+    <button class="modal-close" id="modal-close">✕</button>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+<script>
+let ALL_RECORDS = [];
+let filtered    = [];
+let sortCol     = "score";
+let sortDir     = -1;
+let page        = 1;
+const PAGE_SIZE = 50;
+
+const SEMANTIC = {crit:"var(--crit)", warn:"var(--warn)", good:"var(--good)"};
+
+async function loadData(){
+  try{
+    const r = await fetch("records.json?t="+Date.now());
+    if(!r.ok) throw new Error(r.statusText);
+    const data = await r.json();
+    ALL_RECORDS = data.records || [];
+
+    const d = new Date(data.fetched_at || Date.now());
+    document.getElementById("meta-updated").textContent =
+      "Updated " + d.toLocaleDateString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+    const dr = data.date_range || {};
+    document.getElementById("meta-range").textContent = dr.from && dr.to ? dr.from + " → " + dr.to : "";
+
+    buildStats(ALL_RECORDS);
+    buildCharts(ALL_RECORDS);
+    applyFilters();
+  }catch(e){
+    console.error(e);
+    document.getElementById("leads-body").innerHTML =
+      `<tr><td colspan="9" class="no-data">Could not load records.json — run duval_leads_scraper.py first.</td></tr>`;
+  }
+}
+
+function buildStats(recs){
+  const hot  = recs.filter(r=>r.score>=70).length;
+  const addr = recs.filter(r=>r.prop_address).length;
+  const avg  = recs.length ? (recs.reduce((a,r)=>a+r.score,0)/recs.length).toFixed(1) : 0;
+  const fc   = recs.filter(r=>["foreclosure","tax"].includes(r.cat)).length;
+  const lien = recs.filter(r=>["lien","judgment"].includes(r.cat)).length;
+  document.getElementById("s-total").textContent = recs.length.toLocaleString();
+  document.getElementById("s-hot").textContent   = hot.toLocaleString();
+  document.getElementById("s-addr").textContent  = addr.toLocaleString();
+  document.getElementById("s-avg").textContent   = avg;
+  document.getElementById("s-fc").textContent    = fc.toLocaleString();
+  document.getElementById("s-lien").textContent  = lien.toLocaleString();
+}
+
+function buildCharts(recs){
+  const counts = {};
+  recs.forEach(r=>{counts[r.cat_label]=(counts[r.cat_label]||0)+1;});
+  const sorted = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  const max = sorted[0]?.[1] || 1;
+  document.getElementById("type-chart").innerHTML = sorted.map(([lbl,cnt])=>`
+    <div class="bar-row">
+      <div class="bar-label" title="${lbl}">${lbl}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${(cnt/max*100).toFixed(1)}%"></div></div>
+      <div class="bar-count">${cnt}</div>
+    </div>`).join("") || `<p style="color:var(--muted);font-size:12px">No records yet.</p>`;
+
+  const bands = [
+    {lbl:"Hot · 70–100", key:"crit", fn:r=>r.score>=70},
+    {lbl:"Warm · 50–69", key:"warn", fn:r=>r.score>=50&&r.score<70},
+    {lbl:"Cool · 30–49", key:"good", fn:r=>r.score>=30&&r.score<50},
+    {lbl:"Cold · <30",   key:"good", fn:r=>r.score<30},
+  ];
+  document.getElementById("score-dist").innerHTML = bands.map(b=>{
+    const n = recs.filter(b.fn).length;
+    const pct = recs.length ? Math.round(n/recs.length*100) : 0;
+    return `<div class="dist-row">
+      <span class="dist-name"><span class="dist-swatch" style="background:${SEMANTIC[b.key]}"></span>${b.lbl}</span>
+      <span class="dist-val">${n} <span style="color:var(--muted)">(${pct}%)</span></span>
+    </div>`;
+  }).join("");
+}
+
+function applyFilters(){
+  const q   = document.getElementById("search-input").value.toLowerCase();
+  const cat = document.getElementById("cat-filter").value;
+  const minS = parseInt(document.getElementById("score-filter").value) || 0;
+  const addrOnly = document.getElementById("addr-filter").classList.contains("active");
+
+  filtered = ALL_RECORDS.filter(r=>{
+    if(cat && r.cat !== cat) return false;
+    if(r.score < minS) return false;
+    if(addrOnly && !r.prop_address) return false;
+    if(q){
+      const hay = [r.owner,r.doc_num,r.prop_address,r.grantee,r.legal,r.cat_label].join(" ").toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  filtered.sort((a,b)=>{
+    let av=a[sortCol]??0, bv=b[sortCol]??0;
+    if(typeof av==="string"){av=av.toLowerCase();bv=bv.toLowerCase();}
+    return av<bv ? -sortDir : av>bv ? sortDir : 0;
+  });
+
+  page = 1;
+  renderTable();
+  renderPagination();
+}
+
+function sealClass(s){ return s>=70 ? "s-crit" : s>=50 ? "s-warn" : "s-good"; }
+function catClass(c){ return "cat-"+(c||"other"); }
+function fmt$(a){ if(!a) return "–"; return "$"+parseFloat(a).toLocaleString("en-US",{maximumFractionDigits:0}); }
+
+function renderTable(){
+  const tbody = document.getElementById("leads-body");
+  const start = (page-1)*PAGE_SIZE;
+  const slice = filtered.slice(start, start+PAGE_SIZE);
+
+  if(!slice.length){
+    tbody.innerHTML = `<tr><td colspan="9" class="no-data">No records match your filters.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = slice.map((r,i)=>{
+    const sc = r.score||0;
+    const flags = (r.flags||[]).slice(0,3);
+    const addr = [r.prop_address, r.prop_city].filter(Boolean).join(", ") || "–";
+    return `<tr data-idx="${start+i}">
+      <td><div class="seal ${sealClass(sc)}">${sc}</div></td>
+      <td><span class="tab ${catClass(r.cat)}">${r.cat_label||r.doc_type||"–"}</span></td>
+      <td class="mono">${r.doc_num||"–"}</td>
+      <td class="mono">${r.filed||"–"}</td>
+      <td class="owner-cell">${r.owner||"–"}${r.grantee?`<div class="sub">${r.grantee}</div>`:""}</td>
+      <td class="addr-cell">${addr}</td>
+      <td class="mono">${fmt$(r.amount)}</td>
+      <td>${flags.map(f=>`<span class="flag-pill">${f}</span>`).join(" ")}</td>
+      <td>${r.clerk_url?`<a href="${r.clerk_url}" target="_blank" rel="noopener"
+        style="color:var(--accent);font-size:11px;font-family:var(--mono);text-decoration:none"
+        onclick="event.stopPropagation()">↗</a>`:"–"}</td>
+    </tr>`;
+  }).join("");
+
+  tbody.querySelectorAll("tr[data-idx]").forEach(tr=>{
+    tr.addEventListener("click", ()=> openModal(filtered[parseInt(tr.dataset.idx)]));
+  });
+}
+
+function renderPagination(){
+  const total = Math.ceil(filtered.length / PAGE_SIZE);
+  const el = document.getElementById("pagination");
+  if(total <= 1){ el.innerHTML = filtered.length ? `<span class="page-info">${filtered.length} results</span>` : ""; return; }
+
+  let html = `<span class="page-info">${filtered.length} results</span>`;
+  html += `<button class="page-btn" onclick="goPage(${page-1})" ${page===1?"disabled":""}>‹</button>`;
+  let lo = Math.max(1,page-2), hi = Math.min(total,page+2);
+  if(lo>1) html += `<button class="page-btn" onclick="goPage(1)">1</button>${lo>2?`<span class="page-info">…</span>`:""}`;
+  for(let p=lo;p<=hi;p++) html += `<button class="page-btn${p===page?" active":""}" onclick="goPage(${p})">${p}</button>`;
+  if(hi<total) html += `${hi<total-1?`<span class="page-info">…</span>`:""}<button class="page-btn" onclick="goPage(${total})">${total}</button>`;
+  html += `<button class="page-btn" onclick="goPage(${page+1})" ${page===total?"disabled":""}>›</button>`;
+  el.innerHTML = html;
+}
+function goPage(p){
+  const total = Math.ceil(filtered.length / PAGE_SIZE);
+  page = Math.max(1, Math.min(total, p));
+  renderTable(); renderPagination();
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+
+function openModal(r){
+  const sc = r.score||0;
+  document.getElementById("modal-content").innerHTML = `
+    <div class="modal-seal ${sealClass(sc)}">${sc}</div>
+    <div class="modal-title">${r.owner||"Unknown Owner"}</div>
+    <div class="dgrid">
+      <div class="ditem"><label>Document #</label><div class="v mono">${r.doc_num||"–"}</div></div>
+      <div class="ditem"><label>Document Type</label><div class="v"><span class="tab ${catClass(r.cat)}">${r.doc_type||"–"}</span></div></div>
+      <div class="ditem"><label>Filed</label><div class="v mono">${r.filed||"–"}</div></div>
+      <div class="ditem"><label>Amount</label><div class="v mono">${fmt$(r.amount)}</div></div>
+      <div class="ditem"><label>Other Party</label><div class="v">${r.grantee||"–"}</div></div>
+      <div class="ditem"><label>Source</label><div class="v">${r.source||"–"}</div></div>
+    </div>
+    ${r.legal?`<div class="ditem" style="margin-bottom:14px"><label>Legal Description</label><div class="v" style="font-size:11.5px;color:var(--muted2)">${r.legal}</div></div>`:""}
+    <div class="msection"><h4>Property Address</h4>
+      <div style="font-size:12.5px">${[r.prop_address,r.prop_city,r.prop_state,r.prop_zip].filter(Boolean).join(", ")||"– not found –"}</div>
+    </div>
+    <div class="msection"><h4>Mailing Address</h4>
+      <div style="font-size:12.5px">${[r.mail_address,r.mail_city,r.mail_state,r.mail_zip].filter(Boolean).join(", ")||"– not found –"}</div>
+    </div>
+    <div class="msection"><h4>Flags</h4>
+      <div class="flags-wrap">${(r.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
+    </div>
+    ${r.clerk_url?`<div class="msection"><h4>Public Record</h4>
+      <a class="modal-link" href="${r.clerk_url}" target="_blank" rel="noopener">↗ Open Public Record</a>
+    </div>`:""}
+  `;
+  document.getElementById("modal-bg").classList.add("open");
+}
+document.getElementById("modal-close").addEventListener("click",()=>document.getElementById("modal-bg").classList.remove("open"));
+document.getElementById("modal-bg").addEventListener("click",e=>{ if(e.target.id==="modal-bg") e.currentTarget.classList.remove("open"); });
+document.addEventListener("keydown",e=>{ if(e.key==="Escape") document.getElementById("modal-bg").classList.remove("open"); });
+
+document.querySelectorAll("thead th[data-col]").forEach(th=>{
+  th.addEventListener("click",()=>{
+    const col = th.dataset.col;
+    if(sortCol===col) sortDir*=-1; else { sortCol=col; sortDir=-1; }
+    document.querySelectorAll("thead th").forEach(t=>t.classList.remove("sorted"));
+    th.classList.add("sorted");
+    applyFilters();
+  });
+});
+
+function debounce(fn,ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
+document.getElementById("search-input").addEventListener("input", debounce(applyFilters,200));
+document.getElementById("cat-filter").addEventListener("change", applyFilters);
+document.getElementById("score-filter").addEventListener("change", applyFilters);
+document.getElementById("addr-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });
+
+let downloadsCap = null;
+(async () => {
+  try { downloadsCap = await window.claude?.use?.("downloads"); } catch(e) { downloadsCap = null; }
+  document.getElementById("export-csv-btn").style.display = downloadsCap ? "" : "none";
+})();
+
+document.getElementById("export-csv-btn").addEventListener("click", async ()=>{
+  if(!downloadsCap) return;
+  const cols = ["First Name","Last Name","Mailing Address","Mailing City","Mailing State","Mailing Zip",
+    "Property Address","Property City","Property State","Property Zip","Lead Type","Document Type",
+    "Date Filed","Document Number","Amount","Score","Flags","Source","Public Record URL"];
+  function splitName(full){
+    if(!full) return ["",""];
+    if(full.includes(",")){ const [last,...rest]=full.split(","); return [rest.join(" ").trim(), last.trim()]; }
+    const parts = full.trim().split(/\s+/);
+    return parts.length===1 ? ["",parts[0]] : [parts.slice(0,-1).join(" "), parts[parts.length-1]];
+  }
+  const rows = [cols.join(",")];
+  filtered.forEach(r=>{
+    const [first,last] = splitName(r.owner||"");
+    const vals = [first,last, r.mail_address||"",r.mail_city||"",r.mail_state||"",r.mail_zip||"",
+      r.prop_address||"",r.prop_city||"",r.prop_state||"",r.prop_zip||"",
+      r.cat_label||"",r.doc_type||"",r.filed||"",r.doc_num||"",
+      r.amount||"", r.score||0, (r.flags||[]).join("; "), r.source||"", r.clerk_url||""];
+    rows.push(vals.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(","));
+  });
+  try{
+    await downloadsCap.save({
+      filename: `duval_leads_${new Date().toISOString().slice(0,10)}.csv`,
+      data: rows.join("\n"),
+    });
+  }catch(e){ console.error("download failed", e); }
+});
+
+loadData();
+</script>
