@@ -216,6 +216,31 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
 }
 .no-data{text-align:center;padding:50px 20px;color:var(--muted);font-family:var(--mono);font-size:12.5px}
 
+.view-toggle{display:flex;border:1px solid var(--border2);border-radius:var(--radius);overflow:hidden}
+.view-toggle button{
+  background:var(--bg2);border:none;padding:7px 12px;color:var(--muted);font-family:var(--sans);
+  font-size:12.5px;cursor:pointer;border-right:1px solid var(--border2);
+}
+.view-toggle button:last-child{border-right:none}
+.view-toggle button.active{background:var(--accent);color:var(--accent-ink);font-weight:600}
+
+.tier-badge{
+  display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);
+  font-weight:600;font-size:10.5px;width:22px;height:22px;border-radius:50%;border:2px solid;
+  flex-shrink:0;
+}
+.tier-1{border-color:var(--crit);color:var(--crit);background:color-mix(in srgb, var(--crit) 14%, transparent)}
+.tier-2{border-color:var(--warn);color:var(--warn);background:color-mix(in srgb, var(--warn) 14%, transparent)}
+.tier-3{border-color:var(--muted);color:var(--muted);background:transparent}
+.cat-chip-row{display:flex;flex-wrap:wrap;gap:4px}
+.view-info{
+  font-family:var(--mono);font-size:11.5px;color:var(--muted2);margin-block-end:10px;
+  padding:9px 13px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);
+}
+.view-info b{color:var(--text)}
+.filing-list{margin:0;padding-left:18px;font-size:12px}
+.filing-list li{margin-bottom:4px}
+
 /* ── Pagination ───────────────────────────────────── */
 .pagination{display:flex;align-items:center;gap:6px;padding-block:12px;justify-content:flex-end}
 .page-btn{
@@ -303,6 +328,10 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
   </div>
 
   <div class="toolbar">
+    <div class="view-toggle">
+      <button class="active" id="view-filings" type="button">All Filings</button>
+      <button id="view-compound" type="button">⚡ Compound Distress</button>
+    </div>
     <div class="search-wrap">
       <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
         <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
@@ -330,21 +359,11 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
     <button class="btn-primary" id="export-csv-btn">⇩ Export CSV</button>
   </div>
 
+  <div class="view-info" id="view-info" style="display:none"></div>
+
   <div class="table-wrap">
     <table id="leads-table">
-      <thead>
-        <tr>
-          <th data-col="score">Score</th>
-          <th data-col="cat_label">Type</th>
-          <th data-col="doc_num">Doc #</th>
-          <th data-col="filed">Filed</th>
-          <th data-col="owner">Owner</th>
-          <th data-col="prop_address">Property Address</th>
-          <th data-col="amount">Amount</th>
-          <th>Flags</th>
-          <th>Record</th>
-        </tr>
-      </thead>
+      <thead id="table-head"></thead>
       <tbody id="leads-body"><tr><td colspan="9" class="no-data">Loading records…</td></tr></tbody>
     </table>
   </div>
@@ -369,8 +388,10 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
 </div>
 
 <script>
-let ALL_RECORDS = [];
+let ALL_RECORDS    = [];
+let COMPOUND_GROUPS = [];
 let filtered    = [];
+let viewMode    = "filings";   // "filings" | "compound"
 let sortCol     = "score";
 let sortDir     = -1;
 let page        = 1;
@@ -378,12 +399,72 @@ const PAGE_SIZE = 50;
 
 const SEMANTIC = {crit:"var(--crit)", warn:"var(--warn)", good:"var(--good)"};
 
+// Categories that represent genuine seller distress. Construction notices
+// and satisfactions/releases are routine paperwork (a builder's permit
+// notice, a refinance payoff) -- stacking those up doesn't make an owner
+// more motivated, so they're excluded from compound-distress grouping
+// even though they still show up in the normal "All Filings" view.
+const DISTRESS_CATS = ["foreclosure","tax","judgment","lien","code_violation","probate"];
+
+function normAddr(a){
+  return (a||"").toUpperCase().trim().replace(/[^A-Z0-9 ]/g," ").replace(/\s+/g," ").trim();
+}
+
+// Group every record by property address, then keep only groups that
+// include at least one genuine distress-category record. Tier 1 (multiple
+// DIFFERENT distress types on one property, e.g. a lien AND a judgment) is
+// the strongest "most motivated" signal; Tier 2 is repeated filings of the
+// SAME distress type (e.g. three separate Lis Pendens on one address);
+// Tier 3 is a single distress record.
+function computeCompoundGroups(records){
+  const byAddr = {};
+  records.forEach(r=>{
+    const key = normAddr(r.prop_address);
+    if(!key) return;
+    (byAddr[key] = byAddr[key] || []).push(r);
+  });
+
+  const groups = [];
+  Object.values(byAddr).forEach(group=>{
+    const distress = group.filter(g=>DISTRESS_CATS.includes(g.cat));
+    if(!distress.length) return;
+
+    const cats = [...new Set(distress.map(g=>g.cat))].sort();
+    const catLabels = [...new Set(distress.map(g=>g.cat_label))];
+    const docTypes = [...new Set(distress.map(g=>g.doc_type))];
+    const owners = [...new Set(distress.map(g=>g.owner).filter(Boolean))];
+    const flags = new Set();
+    distress.forEach(g=>(g.flags||[]).forEach(f=>flags.add(f)));
+    const maxScore = Math.max(...distress.map(g=>g.score||0));
+    const tier = cats.length>=2 ? 1 : (distress.length>=2 ? 2 : 3);
+
+    groups.push({
+      address: distress[0].prop_address,
+      prop_city: distress[0].prop_city,
+      prop_zip: distress[0].prop_zip,
+      distinct_cats: cats.length,
+      filing_count: distress.length,
+      cats, catLabels, docTypes, owners,
+      owner: owners.join(" / "),
+      mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
+      mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
+      mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
+      flags: [...flags],
+      max_score: maxScore,
+      tier,
+      records: distress,
+    });
+  });
+  return groups;
+}
+
 async function loadData(){
   try{
     const r = await fetch("records.json?t="+Date.now());
     if(!r.ok) throw new Error(r.statusText);
     const data = await r.json();
     ALL_RECORDS = data.records || [];
+    COMPOUND_GROUPS = computeCompoundGroups(ALL_RECORDS);
 
     const d = new Date(data.fetched_at || Date.now());
     document.getElementById("meta-updated").textContent =
@@ -393,6 +474,7 @@ async function loadData(){
 
     buildStats(ALL_RECORDS);
     buildCharts(ALL_RECORDS);
+    renderTableHead();
     applyFilters();
   }catch(e){
     console.error(e);
@@ -449,33 +531,107 @@ function applyFilters(){
   const minS = parseInt(document.getElementById("score-filter").value) || 0;
   const addrOnly = document.getElementById("addr-filter").classList.contains("active");
 
-  filtered = ALL_RECORDS.filter(r=>{
-    if(cat && r.cat !== cat) return false;
-    if(r.score < minS) return false;
-    if(addrOnly && !r.prop_address) return false;
-    if(q){
-      const hay = [r.owner,r.doc_num,r.prop_address,r.grantee,r.legal,r.cat_label].join(" ").toLowerCase();
-      if(!hay.includes(q)) return false;
-    }
-    return true;
-  });
-
-  filtered.sort((a,b)=>{
-    let av=a[sortCol]??0, bv=b[sortCol]??0;
-    if(typeof av==="string"){av=av.toLowerCase();bv=bv.toLowerCase();}
-    return av<bv ? -sortDir : av>bv ? sortDir : 0;
-  });
+  if(viewMode === "compound"){
+    filtered = COMPOUND_GROUPS.filter(g=>{
+      if(cat && !g.cats.includes(cat)) return false;
+      if(g.max_score < minS) return false;
+      if(q){
+        const hay = [g.owner,g.address,g.catLabels.join(" "),g.flags.join(" ")].join(" ").toLowerCase();
+        if(!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    filtered.sort((a,b)=>{
+      let av=a[sortCol]??0, bv=b[sortCol]??0;
+      if(typeof av==="string"){av=av.toLowerCase();bv=bv.toLowerCase();}
+      return av<bv ? -sortDir : av>bv ? sortDir : 0;
+    });
+  } else {
+    filtered = ALL_RECORDS.filter(r=>{
+      if(cat && r.cat !== cat) return false;
+      if(r.score < minS) return false;
+      if(addrOnly && !r.prop_address) return false;
+      if(q){
+        const hay = [r.owner,r.doc_num,r.prop_address,r.grantee,r.legal,r.cat_label].join(" ").toLowerCase();
+        if(!hay.includes(q)) return false;
+      }
+      return true;
+    });
+    filtered.sort((a,b)=>{
+      let av=a[sortCol]??0, bv=b[sortCol]??0;
+      if(typeof av==="string"){av=av.toLowerCase();bv=bv.toLowerCase();}
+      return av<bv ? -sortDir : av>bv ? sortDir : 0;
+    });
+  }
 
   page = 1;
   renderTable();
   renderPagination();
+  renderViewInfo();
+}
+
+function renderViewInfo(){
+  const el = document.getElementById("view-info");
+  if(viewMode !== "compound"){ el.style.display = "none"; return; }
+  const t1 = COMPOUND_GROUPS.filter(g=>g.tier===1).length;
+  const t2 = COMPOUND_GROUPS.filter(g=>g.tier===2).length;
+  const t3 = COMPOUND_GROUPS.filter(g=>g.tier===3).length;
+  el.style.display = "";
+  el.innerHTML = `Properties grouped by address, keeping only genuine distress signals (excludes routine construction notices/releases). `
+    + `<b>Tier 1</b> = 2+ different distress types on the same property (${t1}) · `
+    + `<b>Tier 2</b> = same type filed repeatedly (${t2}) · `
+    + `<b>Tier 3</b> = single distress record (${t3}). Showing ${filtered.length} of ${COMPOUND_GROUPS.length} total.`;
 }
 
 function sealClass(s){ return s>=70 ? "s-crit" : s>=50 ? "s-warn" : "s-good"; }
 function catClass(c){ return "cat-"+(c||"other"); }
 function fmt$(a){ if(!a) return "–"; return "$"+parseFloat(a).toLocaleString("en-US",{maximumFractionDigits:0}); }
 
+const FILINGS_COLS = [
+  {col:"score", label:"Score"},
+  {col:"cat_label", label:"Type"},
+  {col:"doc_num", label:"Doc #"},
+  {col:"filed", label:"Filed"},
+  {col:"owner", label:"Owner"},
+  {col:"prop_address", label:"Property Address"},
+  {col:"amount", label:"Amount"},
+  {col:null, label:"Flags"},
+  {col:null, label:"Record"},
+];
+const COMPOUND_COLS = [
+  {col:"tier", label:"Tier"},
+  {col:"address", label:"Property Address"},
+  {col:null, label:"Distress Types"},
+  {col:"filing_count", label:"Filings"},
+  {col:"max_score", label:"Score"},
+  {col:"owner", label:"Owner"},
+  {col:null, label:"Mailing"},
+  {col:null, label:"Flags"},
+];
+
+function renderTableHead(){
+  const cols = viewMode === "compound" ? COMPOUND_COLS : FILINGS_COLS;
+  const thead = document.getElementById("table-head");
+  thead.innerHTML = "<tr>" + cols.map(c=>
+    c.col ? `<th data-col="${c.col}">${c.label}</th>` : `<th>${c.label}</th>`
+  ).join("") + "</tr>";
+
+  thead.querySelectorAll("th[data-col]").forEach(th=>{
+    th.addEventListener("click",()=>{
+      const col = th.dataset.col;
+      if(sortCol===col) sortDir*=-1; else { sortCol=col; sortDir = col==="tier" ? 1 : -1; }
+      thead.querySelectorAll("th").forEach(t=>t.classList.remove("sorted"));
+      th.classList.add("sorted");
+      applyFilters();
+    });
+  });
+}
+
 function renderTable(){
+  if(viewMode === "compound") renderCompoundRows(); else renderFilingsRows();
+}
+
+function renderFilingsRows(){
   const tbody = document.getElementById("leads-body");
   const start = (page-1)*PAGE_SIZE;
   const slice = filtered.slice(start, start+PAGE_SIZE);
@@ -506,6 +662,37 @@ function renderTable(){
 
   tbody.querySelectorAll("tr[data-idx]").forEach(tr=>{
     tr.addEventListener("click", ()=> openModal(filtered[parseInt(tr.dataset.idx)]));
+  });
+}
+
+function renderCompoundRows(){
+  const tbody = document.getElementById("leads-body");
+  const start = (page-1)*PAGE_SIZE;
+  const slice = filtered.slice(start, start+PAGE_SIZE);
+
+  if(!slice.length){
+    tbody.innerHTML = `<tr><td colspan="8" class="no-data">No properties match your filters.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = slice.map((g,i)=>{
+    const addr = [g.address, g.prop_city].filter(Boolean).join(", ") || "–";
+    const mail = [g.mail_address, g.mail_city].filter(Boolean).join(", ") || "–";
+    const flags = (g.flags||[]).slice(0,3);
+    return `<tr data-idx="${start+i}">
+      <td><div class="tier-badge tier-${g.tier}">${g.tier}</div></td>
+      <td class="addr-cell">${addr}</td>
+      <td><div class="cat-chip-row">${g.cats.map(c=>`<span class="tab ${catClass(c)}">${c.replace('_',' ')}</span>`).join("")}</div></td>
+      <td class="mono">${g.filing_count}</td>
+      <td><div class="seal ${sealClass(g.max_score)}">${g.max_score}</div></td>
+      <td class="owner-cell">${g.owner||"–"}</td>
+      <td class="addr-cell">${mail}</td>
+      <td>${flags.map(f=>`<span class="flag-pill">${f}</span>`).join(" ")}</td>
+    </tr>`;
+  }).join("");
+
+  tbody.querySelectorAll("tr[data-idx]").forEach(tr=>{
+    tr.addEventListener("click", ()=> openCompoundModal(filtered[parseInt(tr.dataset.idx)]));
   });
 }
 
@@ -559,18 +746,59 @@ function openModal(r){
   `;
   document.getElementById("modal-bg").classList.add("open");
 }
+function openCompoundModal(g){
+  const filingsHtml = g.records.map(r=>
+    `<li><span class="tab ${catClass(r.cat)}" style="margin-right:6px">${r.cat_label}</span>
+     ${r.doc_type} · ${r.filed||"–"} · score ${r.score}${r.grantee?` · vs. ${r.grantee}`:""}</li>`
+  ).join("");
+
+  document.getElementById("modal-content").innerHTML = `
+    <div class="modal-seal ${sealClass(g.max_score)}">${g.max_score}</div>
+    <div class="modal-title">${g.owner||"Unknown Owner"}</div>
+    <div class="dgrid">
+      <div class="ditem"><label>Compound Tier</label><div class="v"><span class="tier-badge tier-${g.tier}" style="display:inline-flex">${g.tier}</span>
+        ${g.tier===1?" multiple different distress types":g.tier===2?" repeated same-type filings":" single distress record"}</div></div>
+      <div class="ditem"><label>Distress Types</label><div class="v">${g.catLabels.join(", ")}</div></div>
+      <div class="ditem"><label>Total Filings</label><div class="v mono">${g.filing_count}</div></div>
+      <div class="ditem"><label>Distinct Categories</label><div class="v mono">${g.distinct_cats}</div></div>
+    </div>
+    <div class="msection"><h4>Property Address</h4>
+      <div style="font-size:12.5px">${[g.address,g.prop_city,"FL",g.prop_zip].filter(Boolean).join(", ")}</div>
+    </div>
+    <div class="msection"><h4>Mailing Address</h4>
+      <div style="font-size:12.5px">${[g.mail_address,g.mail_city,g.mail_state].filter(Boolean).join(", ")||"– not found –"}</div>
+    </div>
+    <div class="msection"><h4>All Filings At This Address</h4>
+      <ul class="filing-list">${filingsHtml}</ul>
+    </div>
+    <div class="msection"><h4>Flags</h4>
+      <div class="flags-wrap">${(g.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
+    </div>
+  `;
+  document.getElementById("modal-bg").classList.add("open");
+}
+
 document.getElementById("modal-close").addEventListener("click",()=>document.getElementById("modal-bg").classList.remove("open"));
 document.getElementById("modal-bg").addEventListener("click",e=>{ if(e.target.id==="modal-bg") e.currentTarget.classList.remove("open"); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape") document.getElementById("modal-bg").classList.remove("open"); });
 
-document.querySelectorAll("thead th[data-col]").forEach(th=>{
-  th.addEventListener("click",()=>{
-    const col = th.dataset.col;
-    if(sortCol===col) sortDir*=-1; else { sortCol=col; sortDir=-1; }
-    document.querySelectorAll("thead th").forEach(t=>t.classList.remove("sorted"));
-    th.classList.add("sorted");
-    applyFilters();
-  });
+document.getElementById("view-filings").addEventListener("click", function(){
+  if(viewMode==="filings") return;
+  viewMode = "filings"; sortCol = "score"; sortDir = -1;
+  this.classList.add("active");
+  document.getElementById("view-compound").classList.remove("active");
+  document.getElementById("addr-filter").style.display = "";
+  renderTableHead();
+  applyFilters();
+});
+document.getElementById("view-compound").addEventListener("click", function(){
+  if(viewMode==="compound") return;
+  viewMode = "compound"; sortCol = "tier"; sortDir = 1;
+  this.classList.add("active");
+  document.getElementById("view-filings").classList.remove("active");
+  document.getElementById("addr-filter").style.display = "none";
+  renderTableHead();
+  applyFilters();
 });
 
 function debounce(fn,ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
@@ -585,29 +813,47 @@ let downloadsCap = null;
   document.getElementById("export-csv-btn").style.display = downloadsCap ? "" : "none";
 })();
 
+function splitName(full){
+  if(!full) return ["",""];
+  if(full.includes(",")){ const [last,...rest]=full.split(","); return [rest.join(" ").trim(), last.trim()]; }
+  const parts = full.trim().split(/\s+/);
+  return parts.length===1 ? ["",parts[0]] : [parts.slice(0,-1).join(" "), parts[parts.length-1]];
+}
+
 document.getElementById("export-csv-btn").addEventListener("click", async ()=>{
   if(!downloadsCap) return;
-  const cols = ["First Name","Last Name","Mailing Address","Mailing City","Mailing State","Mailing Zip",
-    "Property Address","Property City","Property State","Property Zip","Lead Type","Document Type",
-    "Date Filed","Document Number","Amount","Score","Flags","Source","Public Record URL"];
-  function splitName(full){
-    if(!full) return ["",""];
-    if(full.includes(",")){ const [last,...rest]=full.split(","); return [rest.join(" ").trim(), last.trim()]; }
-    const parts = full.trim().split(/\s+/);
-    return parts.length===1 ? ["",parts[0]] : [parts.slice(0,-1).join(" "), parts[parts.length-1]];
+  let rows;
+
+  if(viewMode === "compound"){
+    const cols = ["First Name","Last Name","Mailing Address","Mailing City","Mailing State",
+      "Property Address","Property City","Property Zip","Tier","Distinct Distress Types",
+      "Total Filings","Distress Types","Doc Types","Max Score","Flags"];
+    rows = [cols.join(",")];
+    filtered.forEach(g=>{
+      const [first,last] = splitName(g.owner||"");
+      const vals = [first,last, g.mail_address||"",g.mail_city||"",g.mail_state||"",
+        g.address||"",g.prop_city||"",g.prop_zip||"", g.tier, g.distinct_cats, g.filing_count,
+        g.catLabels.join("; "), g.docTypes.join("; "), g.max_score, (g.flags||[]).join("; ")];
+      rows.push(vals.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(","));
+    });
+  } else {
+    const cols = ["First Name","Last Name","Mailing Address","Mailing City","Mailing State","Mailing Zip",
+      "Property Address","Property City","Property State","Property Zip","Lead Type","Document Type",
+      "Date Filed","Document Number","Amount","Score","Flags","Source","Public Record URL"];
+    rows = [cols.join(",")];
+    filtered.forEach(r=>{
+      const [first,last] = splitName(r.owner||"");
+      const vals = [first,last, r.mail_address||"",r.mail_city||"",r.mail_state||"",r.mail_zip||"",
+        r.prop_address||"",r.prop_city||"",r.prop_state||"",r.prop_zip||"",
+        r.cat_label||"",r.doc_type||"",r.filed||"",r.doc_num||"",
+        r.amount||"", r.score||0, (r.flags||[]).join("; "), r.source||"", r.clerk_url||""];
+      rows.push(vals.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(","));
+    });
   }
-  const rows = [cols.join(",")];
-  filtered.forEach(r=>{
-    const [first,last] = splitName(r.owner||"");
-    const vals = [first,last, r.mail_address||"",r.mail_city||"",r.mail_state||"",r.mail_zip||"",
-      r.prop_address||"",r.prop_city||"",r.prop_state||"",r.prop_zip||"",
-      r.cat_label||"",r.doc_type||"",r.filed||"",r.doc_num||"",
-      r.amount||"", r.score||0, (r.flags||[]).join("; "), r.source||"", r.clerk_url||""];
-    rows.push(vals.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(","));
-  });
+
   try{
     await downloadsCap.save({
-      filename: `duval_leads_${new Date().toISOString().slice(0,10)}.csv`,
+      filename: `duval_${viewMode}_${new Date().toISOString().slice(0,10)}.csv`,
       data: rows.join("\n"),
     });
   }catch(e){ console.error("download failed", e); }
