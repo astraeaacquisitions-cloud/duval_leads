@@ -336,7 +336,7 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
       <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
         <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
       </svg>
-      <input type="search" id="search-input" placeholder="Search owner, doc #, address…"/>
+      <input type="search" id="search-input" placeholder="Search owner, doc #, address, city, zip…"/>
     </div>
     <select id="cat-filter">
       <option value="">All Categories</option>
@@ -536,7 +536,7 @@ function applyFilters(){
       if(cat && !g.cats.includes(cat)) return false;
       if(g.max_score < minS) return false;
       if(q){
-        const hay = [g.owner,g.address,g.catLabels.join(" "),g.flags.join(" ")].join(" ").toLowerCase();
+        const hay = [g.owner,g.address,g.prop_city,g.prop_zip,g.catLabels.join(" "),g.flags.join(" ")].join(" ").toLowerCase();
         if(!hay.includes(q)) return false;
       }
       return true;
@@ -552,7 +552,7 @@ function applyFilters(){
       if(r.score < minS) return false;
       if(addrOnly && !r.prop_address) return false;
       if(q){
-        const hay = [r.owner,r.doc_num,r.prop_address,r.grantee,r.legal,r.cat_label].join(" ").toLowerCase();
+        const hay = [r.owner,r.doc_num,r.prop_address,r.prop_city,r.prop_zip,r.grantee,r.legal,r.cat_label].join(" ").toLowerCase();
         if(!hay.includes(q)) return false;
       }
       return true;
