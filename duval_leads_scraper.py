@@ -553,6 +553,7 @@ def compute_score_flags(cat, filed_date, owner_name, prop_address, mail_address,
 def build_records(days_back, delay_records, delay_pao, max_detail_scan):
     session = new_pao_session()
     records = []
+    seen_doc_nums = set()
 
     # -- Official Records --
     raw = fetch_distress_records(days_back, delay=delay_records)
@@ -612,7 +613,11 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
             "source": "Duval County Clerk -- Official Records",
         }
         if not zip_excluded(record["prop_zip"]):
-            records.append(record)
+            if record["doc_num"] in seen_doc_nums:
+                print(f"[dedup] skipped duplicate doc_num {record['doc_num']}")
+            else:
+                seen_doc_nums.add(record["doc_num"])
+                records.append(record)
 
     # -- Tax deed auction --
     auction_date = None
@@ -671,7 +676,11 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
                 "source": "Duval County Tax Deed Auction",
             }
             if not zip_excluded(record["prop_zip"]):
-                records.append(record)
+                if record["doc_num"] in seen_doc_nums:
+                    print(f"[dedup] skipped duplicate doc_num {record['doc_num']}")
+                else:
+                    seen_doc_nums.add(record["doc_num"])
+                    records.append(record)
 
     return records
 
