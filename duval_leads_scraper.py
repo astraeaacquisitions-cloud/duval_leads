@@ -448,11 +448,45 @@ def get_detail(session, re_raw):
         mailing_address = ""
         mailing_csz = ""
 
+    market_value_str = (
+        text("ctl00_cphBody_lblJustMarketValueInProgress")
+        or text("ctl00_cphBody_lblJustMarketValueCertified")
+    )
+    market_value = None
+    if market_value_str:
+        try:
+            market_value = float(market_value_str.replace("$", "").replace(",", ""))
+        except ValueError:
+            pass
+
+    last_sale_date = None
+    last_sale_price = None
+    sales_table = soup.find(id="ctl00_cphBody_gridSalesHistory")
+    if sales_table:
+        data_rows = sales_table.find_all("tr")[1:]
+        if data_rows:
+            cells = data_rows[0].find_all("td")
+            if len(cells) >= 3:
+                date_str = cells[1].get_text(strip=True)
+                try:
+                    m, d, y = date_str.split("/")
+                    last_sale_date = f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+                except ValueError:
+                    pass
+                price_str = cells[2].get_text(strip=True)
+                try:
+                    last_sale_price = float(price_str.replace("$", "").replace(",", ""))
+                except ValueError:
+                    pass
+
     return {
         "subdivision": subdivision,
         "mailing_name": mailing_name,
         "mailing_address": mailing_address,
         "mailing_city_state_zip": mailing_csz,
+        "market_value": market_value,
+        "last_sale_date": last_sale_date,
+        "last_sale_price": last_sale_price,
     }
 
 
@@ -601,6 +635,15 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
         if is_code_violation:
             flags.append("Filed by city/county")
 
+        last_sale_date = match.get("last_sale_date")
+        years_owned = None
+        if last_sale_date:
+            try:
+                sale_year = int(last_sale_date[:4])
+                years_owned = datetime.date.today().year - sale_year
+            except (ValueError, TypeError):
+                pass
+
         record = {
             "doc_num": r.get("InstrumentNumber", ""),
             "doc_type": r.get("DocTypeDescription", ""),
@@ -623,6 +666,9 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
             "flags": flags,
             "score": score,
             "source": "Duval County Clerk -- Official Records",
+            "market_value": match.get("market_value"),
+            "last_sale_date": last_sale_date,
+            "years_owned": years_owned,
         }
         if (
             not zip_excluded(record["prop_zip"])
@@ -668,6 +714,15 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
             city = item["city_state_zip"].split(",")[0].strip() if "," in item["city_state_zip"] else ""
             zipm = re.search(r"(\d{5})", item["city_state_zip"])
 
+            last_sale_date = detail.get("last_sale_date")
+            years_owned = None
+            if last_sale_date:
+                try:
+                    sale_year = int(last_sale_date[:4])
+                    years_owned = datetime.date.today().year - sale_year
+                except (ValueError, TypeError):
+                    pass
+
             record = {
                 "doc_num": item["case_number"],
                 "doc_type": "TAX DEED",
@@ -690,6 +745,9 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
                 "flags": flags,
                 "score": score,
                 "source": "Duval County Tax Deed Auction",
+                "market_value": detail.get("market_value"),
+                "last_sale_date": last_sale_date,
+                "years_owned": years_owned,
             }
             if (
                 not zip_excluded(record["prop_zip"])
