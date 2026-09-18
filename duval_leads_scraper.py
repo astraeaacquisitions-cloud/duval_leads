@@ -294,6 +294,14 @@ ENTITY_PATTERN = re.compile(
     re.I,
 )
 
+
+def is_entity_owned(owner_name):
+    return bool(ENTITY_PATTERN.search(owner_name or ""))
+
+
+def is_unit_address(addr):
+    return bool(re.search(r"\bUNIT\b", addr or "", re.I))
+
 # Duval's Official Records has no distinct "Code Violation" doc type --
 # code enforcement liens are just filed as generic LIEN. The only way to
 # separate them out is by WHO filed the lien: if the filer (the "grantee"
@@ -616,7 +624,11 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
             "score": score,
             "source": "Duval County Clerk -- Official Records",
         }
-        if not zip_excluded(record["prop_zip"]):
+        if (
+            not zip_excluded(record["prop_zip"])
+            and not is_entity_owned(record["owner"])
+            and not is_unit_address(record["prop_address"])
+        ):
             if record["doc_num"] in seen_doc_nums:
                 print(f"[dedup] skipped duplicate doc_num {record['doc_num']}")
             else:
@@ -679,7 +691,11 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
                 "score": score,
                 "source": "Duval County Tax Deed Auction",
             }
-            if not zip_excluded(record["prop_zip"]):
+            if (
+                not zip_excluded(record["prop_zip"])
+                and not is_entity_owned(record["owner"])
+                and not is_unit_address(record["prop_address"])
+            ):
                 if record["doc_num"] in seen_doc_nums:
                     print(f"[dedup] skipped duplicate doc_num {record['doc_num']}")
                 else:
