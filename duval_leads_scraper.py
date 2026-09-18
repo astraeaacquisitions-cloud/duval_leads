@@ -279,6 +279,14 @@ NUMBER_WORDS = {
     "SIX": "6", "SEVEN": "7", "EIGHT": "8", "NINE": "9", "TEN": "10",
     "ELEVEN": "11", "TWELVE": "12",
 }
+
+EXCLUDED_ZIPS = {"32209"}
+
+
+def zip_excluded(z):
+    return any((z or "").strip().startswith(ez) for ez in EXCLUDED_ZIPS)
+
+
 ENTITY_PATTERN = re.compile(
     r"LAND\s*TRUST|\bLLC\b|\bL\.L\.C\.?\b|\bINC\.?\b|\bCORP(?:ORATION)?\.?\b|"
     r"\bLP\b|\bLLP\b|\bLTD\.?\b|\bCOMPANY\b|\bHOLDINGS\b|\bENTERPRISES\b|"
@@ -580,7 +588,7 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
         if is_code_violation:
             flags.append("Filed by city/county")
 
-        records.append({
+        record = {
             "doc_num": r.get("InstrumentNumber", ""),
             "doc_type": r.get("DocTypeDescription", ""),
             "filed": filed,
@@ -602,7 +610,9 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
             "flags": flags,
             "score": score,
             "source": "Duval County Clerk -- Official Records",
-        })
+        }
+        if not zip_excluded(record["prop_zip"]):
+            records.append(record)
 
     # -- Tax deed auction --
     auction_date = None
@@ -637,7 +647,7 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
             city = item["city_state_zip"].split(",")[0].strip() if "," in item["city_state_zip"] else ""
             zipm = re.search(r"(\d{5})", item["city_state_zip"])
 
-            records.append({
+            record = {
                 "doc_num": item["case_number"],
                 "doc_type": "TAX DEED",
                 "filed": auction_date.replace("/", "-") if auction_date else "",
@@ -659,7 +669,9 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
                 "flags": flags,
                 "score": score,
                 "source": "Duval County Tax Deed Auction",
-            })
+            }
+            if not zip_excluded(record["prop_zip"]):
+                records.append(record)
 
     return records
 
