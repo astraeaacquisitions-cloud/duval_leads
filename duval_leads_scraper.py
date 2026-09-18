@@ -605,8 +605,12 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
         })
 
     # -- Tax deed auction --
-    td_session = new_taxdeed_session()
-    auction_date = get_next_auction_date(td_session)
+    auction_date = None
+    try:
+        td_session = new_taxdeed_session()
+        auction_date = get_next_auction_date(td_session)
+    except Exception as e:
+        print(f"[taxdeed] Skipping tax deed auction -- site unreachable: {e}")
     if auction_date:
         print(f"[taxdeed] Next auction: {auction_date}")
         items = fetch_taxdeed_auction(auction_date)
