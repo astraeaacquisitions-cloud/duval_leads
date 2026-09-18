@@ -1,2 +1,3 @@
 scraper_run.log
 records.json
+__pycache__/
