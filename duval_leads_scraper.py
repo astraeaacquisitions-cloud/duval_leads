@@ -566,10 +566,14 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
 
         name = r.get(owner_field, "")
         legal = r.get("DocLegalDescription", "")
-        if name not in cache:
+        # The county doesn't give a stable per-owner match: two filings under the same
+        # name can be for different parcels, and only the legal description tells them
+        # apart, so the cache must be keyed on both.
+        cache_key = (name, legal)
+        if cache_key not in cache:
             print(f"[pao {i}/{len(raw)}] ({cat}) {name}")
-            cache[name] = resolve_owner(session, name, legal, max_detail_scan, delay_pao)
-        match = cache[name] or {}
+            cache[cache_key] = resolve_owner(session, name, legal, max_detail_scan, delay_pao)
+        match = cache[cache_key] or {}
 
         owner_full = name
         other_party = r.get(other_field, "")
