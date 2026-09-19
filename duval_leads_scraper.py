@@ -614,7 +614,11 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
         cache_key = (name, legal)
         if cache_key not in cache:
             print(f"[pao {i}/{len(raw)}] ({cat}) {name}")
-            cache[cache_key] = resolve_owner(session, name, legal, max_detail_scan, delay_pao)
+            try:
+                cache[cache_key] = resolve_owner(session, name, legal, max_detail_scan, delay_pao)
+            except Exception as e:
+                print(f"  !! PAO lookup failed, skipping match: {e}")
+                cache[cache_key] = None
         match = cache[cache_key] or {}
 
         owner_full = name
