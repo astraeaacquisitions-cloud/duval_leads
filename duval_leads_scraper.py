@@ -288,7 +288,9 @@ def zip_excluded(z):
 
 
 ENTITY_PATTERN = re.compile(
-    r"LAND\s*TRUST|\bLLC\b|\bL\.L\.C\.?\b|\bINC\.?\b|\bCORP(?:ORATION)?\.?\b|"
+    # \bTRUST\b covers all trusts (living, family, revocable, land, bare "<Name> Trust");
+    # LAND\s*TRUST is kept too even though it's now redundant with \bTRUST\b.
+    r"LAND\s*TRUST|\bTRUST\b|\bLLC\b|\bL\.L\.C\.?\b|\bINC\.?\b|\bCORP(?:ORATION)?\.?\b|"
     r"\bLP\b|\bLLP\b|\bLTD\.?\b|\bCOMPANY\b|\bHOLDINGS\b|\bENTERPRISES\b|"
     r"\bINVESTMENTS?\s*(GROUP)?\b|\bPROPERTIES\b|\bCAPITAL\b|\bVENTURES?\b",
     re.I,
