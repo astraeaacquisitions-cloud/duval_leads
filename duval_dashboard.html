@@ -288,6 +288,40 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
 }
 .modal-link:hover{background:color-mix(in srgb, var(--accent) 12%, transparent)}
 
+tbody tr.is-suppressed{opacity:.45}
+.badge-suppressed{
+  display:inline-flex;align-items:center;font-family:var(--mono);font-size:9px;
+  padding:2px 6px;border-radius:2px;text-transform:uppercase;letter-spacing:.04em;
+  border:1px solid var(--crit);color:var(--crit);margin-left:6px;
+}
+.badge-confidence{
+  display:inline-flex;align-items:center;font-family:var(--mono);font-size:9px;
+  padding:1px 5px;border-radius:2px;border:1px solid var(--border2);color:var(--muted);
+}
+.badge-trust{
+  display:inline-flex;align-items:center;font-family:var(--mono);font-size:9px;
+  padding:1px 5px;border-radius:2px;border:1px solid var(--warn);color:var(--warn);
+}
+.lead-mgmt{border-top:1px solid var(--border);padding-top:13px;margin-top:13px}
+.lead-mgmt h4{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--muted);margin-bottom:10px}
+.lead-mgmt-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.lead-mgmt-row label{font-size:12px;display:flex;align-items:center;gap:5px;cursor:pointer}
+.lead-mgmt select, .lead-mgmt textarea{
+  background:var(--bg3);border:1px solid var(--border2);border-radius:var(--radius);
+  padding:5px 8px;color:var(--text);font-family:var(--sans);font-size:12px;
+}
+.lead-mgmt textarea{width:100%;min-height:50px;resize:vertical;margin-bottom:6px}
+.lead-mgmt-btn{
+  background:var(--bg3);border:1px solid var(--border2);border-radius:var(--radius);
+  padding:5px 11px;color:var(--text);font-family:var(--sans);font-size:11.5px;cursor:pointer;
+}
+.lead-mgmt-btn:hover{border-color:var(--accent);color:var(--accent)}
+.note-item{font-size:11.5px;color:var(--muted2);padding:5px 0;border-bottom:1px dashed var(--border)}
+.note-item:last-child{border-bottom:none}
+.note-item .note-meta{font-family:var(--mono);font-size:9.5px;color:var(--muted)}
+.lead-mgmt-disabled{font-size:11.5px;color:var(--muted);font-style:italic}
+
 .footnote{font-size:11px;color:var(--muted);margin-block-start:18px;line-height:1.6}
 .footnote a{color:var(--accent)}
 </style>
@@ -354,7 +388,15 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
       <option value="70">Hot ≥ 70</option>
       <option value="50">Warm ≥ 50</option>
     </select>
+    <select id="years-filter" title="Estimated from the Property Appraiser's sales history — a proxy for equity, not an exact figure. Owner tenure and current market value, not a mortgage-balance-based number.">
+      <option value="0">Any Years Owned</option>
+      <option value="5">5+ yrs owned</option>
+      <option value="10">10+ yrs owned</option>
+      <option value="15">15+ yrs owned</option>
+      <option value="20">20+ yrs owned</option>
+    </select>
     <button class="chip" id="addr-filter">Has Address</button>
+    <button class="chip active" id="suppressed-filter">Hide Suppressed</button>
     <div class="spacer"></div>
     <button class="btn-primary" id="export-csv-btn">⇩ Export CSV</button>
   </div>
@@ -376,6 +418,13 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
     record before acting on it. Neither clerk system exposes a public deep link to the scanned
     document image; the "Record" links go to the relevant public search page or, for tax-deed
     items, straight to the parcel's Property Appraiser record.
+    <br/><br/>
+    <strong>Owner name caveat:</strong> the "Owner" field is the party named in the underlying court
+    filing (e.g. the defendant on a Lis Pendens) — it reflects who is legally involved in that case,
+    not necessarily who currently holds title. Title can move (marriage, divorce, an asset-protection
+    transfer) faster than court and tax records catch up, so the current owner of record elsewhere
+    (a skip-trace tool, the tax roll) can show a different name at the same address. Cross-check
+    before reaching out; treat both names as connected to the property, not a mismatch to discard.
   </p>
 
 </div>
@@ -397,7 +446,25 @@ let sortDir     = -1;
 let page        = 1;
 const PAGE_SIZE = 50;
 
+// Dashboard-originated state (suppression, notes, HubSpot approval) --
+// keyed by property_id, one doc per edited property in the artifact's
+// `leads` collection. This is a convenience write surface, not the
+// system of record: the pipeline syncs it back into the durable
+// database on every scheduled run, so nothing here is the only copy.
+let LEAD_STATE = {};
+let dbCap = null;
+let userCap = null;
+let myId = null;
+
 const SEMANTIC = {crit:"var(--crit)", warn:"var(--warn)", good:"var(--good)"};
+
+const SUPPRESSION_REASONS = [
+  ["NOT_INTERESTED_TODAY", "Not interested today"],
+  ["DNC", "Do not contact"],
+  ["PERMANENTLY_INVALID", "Permanently invalid"],
+  ["RESOLVED", "Resolved / no longer distressed"],
+  ["OTHER", "Other"],
+];
 
 // Categories that represent genuine seller distress. Construction notices
 // and satisfactions/releases are routine paperwork (a builder's permit
@@ -436,9 +503,11 @@ function computeCompoundGroups(records){
     const flags = new Set();
     distress.forEach(g=>(g.flags||[]).forEach(f=>flags.add(f)));
     const maxScore = Math.max(...distress.map(g=>g.score||0));
+    const yearsOwned = Math.max(...distress.map(g=>g.years_owned ?? -1));
     const tier = cats.length>=2 ? 1 : (distress.length>=2 ? 2 : 3);
 
     groups.push({
+      property_id: distress[0].property_id,
       address: distress[0].prop_address,
       prop_city: distress[0].prop_city,
       prop_zip: distress[0].prop_zip,
@@ -446,6 +515,8 @@ function computeCompoundGroups(records){
       filing_count: distress.length,
       cats, catLabels, docTypes, owners,
       owner: owners.join(" / "),
+      years_owned: yearsOwned >= 0 ? yearsOwned : null,
+      market_value: (distress.find(g=>g.market_value)||{}).market_value ?? null,
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -525,16 +596,25 @@ function buildCharts(recs){
   }).join("");
 }
 
+function isSuppressed(propertyId){
+  const s = propertyId && LEAD_STATE[propertyId];
+  return !!(s && s.suppressed);
+}
+
 function applyFilters(){
   const q   = document.getElementById("search-input").value.toLowerCase();
   const cat = document.getElementById("cat-filter").value;
   const minS = parseInt(document.getElementById("score-filter").value) || 0;
+  const minYears = parseInt(document.getElementById("years-filter").value) || 0;
   const addrOnly = document.getElementById("addr-filter").classList.contains("active");
+  const hideSuppressed = document.getElementById("suppressed-filter").classList.contains("active");
 
   if(viewMode === "compound"){
     filtered = COMPOUND_GROUPS.filter(g=>{
+      if(hideSuppressed && isSuppressed(g.property_id)) return false;
       if(cat && !g.cats.includes(cat)) return false;
       if(g.max_score < minS) return false;
+      if(minYears && (g.years_owned==null || g.years_owned < minYears)) return false;
       if(q){
         const hay = [g.owner,g.address,g.prop_city,g.prop_zip,g.catLabels.join(" "),g.flags.join(" ")].join(" ").toLowerCase();
         if(!hay.includes(q)) return false;
@@ -548,8 +628,10 @@ function applyFilters(){
     });
   } else {
     filtered = ALL_RECORDS.filter(r=>{
+      if(hideSuppressed && isSuppressed(r.property_id)) return false;
       if(cat && r.cat !== cat) return false;
       if(r.score < minS) return false;
+      if(minYears && (r.years_owned==null || r.years_owned < minYears)) return false;
       if(addrOnly && !r.prop_address) return false;
       if(q){
         const hay = [r.owner,r.doc_num,r.prop_address,r.prop_city,r.prop_zip,r.grantee,r.legal,r.cat_label].join(" ").toLowerCase();
@@ -645,9 +727,10 @@ function renderFilingsRows(){
     const sc = r.score||0;
     const flags = (r.flags||[]).slice(0,3);
     const addr = [r.prop_address, r.prop_city].filter(Boolean).join(", ") || "–";
-    return `<tr data-idx="${start+i}">
+    const suppressed = isSuppressed(r.property_id);
+    return `<tr data-idx="${start+i}"${suppressed?' class="is-suppressed"':''}>
       <td><div class="seal ${sealClass(sc)}">${sc}</div></td>
-      <td><span class="tab ${catClass(r.cat)}">${r.cat_label||r.doc_type||"–"}</span></td>
+      <td><span class="tab ${catClass(r.cat)}">${r.cat_label||r.doc_type||"–"}</span>${suppressed?'<span class="badge-suppressed">Suppressed</span>':''}</td>
       <td class="mono">${r.doc_num||"–"}</td>
       <td class="mono">${r.filed||"–"}</td>
       <td class="owner-cell">${r.owner||"–"}${r.grantee?`<div class="sub">${r.grantee}</div>`:""}</td>
@@ -679,8 +762,9 @@ function renderCompoundRows(){
     const addr = [g.address, g.prop_city].filter(Boolean).join(", ") || "–";
     const mail = [g.mail_address, g.mail_city].filter(Boolean).join(", ") || "–";
     const flags = (g.flags||[]).slice(0,3);
-    return `<tr data-idx="${start+i}">
-      <td><div class="tier-badge tier-${g.tier}">${g.tier}</div></td>
+    const suppressed = isSuppressed(g.property_id);
+    return `<tr data-idx="${start+i}"${suppressed?' class="is-suppressed"':''}>
+      <td><div class="tier-badge tier-${g.tier}">${g.tier}</div>${suppressed?'<span class="badge-suppressed">Suppr.</span>':''}</td>
       <td class="addr-cell">${addr}</td>
       <td><div class="cat-chip-row">${g.cats.map(c=>`<span class="tab ${catClass(c)}">${c.replace('_',' ')}</span>`).join("")}</div></td>
       <td class="mono">${g.filing_count}</td>
@@ -717,6 +801,12 @@ function goPage(p){
   window.scrollTo({top:0,behavior:"smooth"});
 }
 
+function confidenceLabel(c){
+  return {verified_parcel:"Verified parcel", address_only:"Address match only",
+    name_and_mailing_address:"Verified name+address", name_and_property_only:"Name+property only",
+    name_only_unmerged:"Unconfirmed identity", unmatched:"Unmatched"}[c] || c || "Unknown";
+}
+
 function openModal(r){
   const sc = r.score||0;
   document.getElementById("modal-content").innerHTML = `
@@ -737,14 +827,28 @@ function openModal(r){
     <div class="msection"><h4>Mailing Address</h4>
       <div style="font-size:12.5px">${[r.mail_address,r.mail_city,r.mail_state,r.mail_zip].filter(Boolean).join(", ")||"– not found –"}</div>
     </div>
+    <div class="msection"><h4>Equity Proxy <span style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">(estimate, not a real equity %)</span></h4>
+      <div style="font-size:12.5px">${r.years_owned!=null?`Owned ${r.years_owned} year${r.years_owned===1?"":"s"}${r.last_sale_date?` (since ${r.last_sale_date})`:""}`:"– sale history not found –"}${r.market_value?` · County market value ${fmt$(r.market_value)}`:""}</div>
+    </div>
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(r.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
     </div>
     ${r.clerk_url?`<div class="msection"><h4>Public Record</h4>
       <a class="modal-link" href="${r.clerk_url}" target="_blank" rel="noopener">↗ Open Public Record</a>
     </div>`:""}
+    <div class="msection"><h4>Identity &amp; Data Health</h4>
+      <div class="dgrid">
+        <div class="ditem"><label>Property ID</label><div class="v mono" style="font-size:11px">${r.property_id||"– unmatched –"}</div></div>
+        <div class="ditem"><label>RE# (Parcel)</label><div class="v mono">${r.re_number||"–"}</div></div>
+        <div class="ditem"><label>Address Confidence</label><div class="v"><span class="badge-confidence">${confidenceLabel(r.address_match_confidence)}</span></div></div>
+        <div class="ditem"><label>Owner Identity Confidence</label><div class="v"><span class="badge-confidence">${confidenceLabel(r.owner_identity_confidence)}</span></div></div>
+      </div>
+      ${(r.flags||[]).includes("TRUST_OWNERSHIP_REVIEW_REQUIRED")?`<div style="margin-top:8px"><span class="badge-trust">⚑ Trust ownership -- verify trustee authority before contact</span></div>`:""}
+    </div>
+    ${renderLeadMgmtHtml(r.property_id)}
   `;
   document.getElementById("modal-bg").classList.add("open");
+  wireLeadMgmt(r.property_id);
 }
 function openCompoundModal(g){
   const filingsHtml = g.records.map(r=>
@@ -768,14 +872,118 @@ function openCompoundModal(g){
     <div class="msection"><h4>Mailing Address</h4>
       <div style="font-size:12.5px">${[g.mail_address,g.mail_city,g.mail_state].filter(Boolean).join(", ")||"– not found –"}</div>
     </div>
+    <div class="msection"><h4>Equity Proxy <span style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">(estimate, not a real equity %)</span></h4>
+      <div style="font-size:12.5px">${g.years_owned!=null?`Owned ${g.years_owned} year${g.years_owned===1?"":"s"}`:"– sale history not found –"}${g.market_value?` · County market value ${fmt$(g.market_value)}`:""}</div>
+    </div>
     <div class="msection"><h4>All Filings At This Address</h4>
       <ul class="filing-list">${filingsHtml}</ul>
     </div>
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(g.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
+      ${(g.flags||[]).includes("TRUST_OWNERSHIP_REVIEW_REQUIRED")?`<div style="margin-top:8px"><span class="badge-trust">⚑ Trust ownership -- verify trustee authority before contact</span></div>`:""}
     </div>
+    <div class="msection"><h4>Identity</h4>
+      <div class="ditem"><label>Property ID</label><div class="v mono" style="font-size:11px">${g.property_id||"– unmatched –"}</div></div>
+    </div>
+    ${renderLeadMgmtHtml(g.property_id)}
   `;
   document.getElementById("modal-bg").classList.add("open");
+  wireLeadMgmt(g.property_id);
+}
+
+// ---------------------------------------------------------------------------
+// Lead management (suppression / notes / HubSpot approval) -- backed by
+// the artifact's `db` capability. Read-only degrades gracefully when the
+// capability, or edit access to it, is unavailable. This is a convenience
+// write surface only: the pipeline is expected to sync it into the
+// durable system of record on every scheduled run, not treat it as the
+// only copy.
+// ---------------------------------------------------------------------------
+
+function renderLeadMgmtHtml(propertyId){
+  if(!propertyId){
+    return `<div class="lead-mgmt"><h4>Lead Management</h4>
+      <p class="lead-mgmt-disabled">No stable property ID for this record -- the Property Appraiser lookup didn't resolve an address, so this can't be tracked yet. See the research queue.</p>
+    </div>`;
+  }
+  if(!dbCap){
+    return `<div class="lead-mgmt" data-property-id="${propertyId}"><h4>Lead Management</h4>
+      <p class="lead-mgmt-disabled">Lead management needs edit access to this page.</p>
+    </div>`;
+  }
+  const state = LEAD_STATE[propertyId] || {};
+  const notes = state.notes || [];
+  const reasonOptions = SUPPRESSION_REASONS.map(([code,label]) =>
+    `<option value="${code}" ${state.suppression_reason_code===code?"selected":""}>${label}</option>`
+  ).join("");
+  const notesHtml = notes.slice(-10).reverse().map(n =>
+    `<div class="note-item"><div>${n.text}</div><div class="note-meta">${n.at?new Date(n.at).toLocaleString():""}</div></div>`
+  ).join("") || `<p class="lead-mgmt-disabled">No notes yet.</p>`;
+
+  return `<div class="lead-mgmt" data-property-id="${propertyId}">
+    <h4>Lead Management</h4>
+    <div class="lead-mgmt-row">
+      <label><input type="checkbox" id="lm-suppress" ${state.suppressed?"checked":""}/> Suppress this lead</label>
+      <select id="lm-reason">${reasonOptions}</select>
+    </div>
+    <div class="lead-mgmt-row">
+      <label><input type="checkbox" id="lm-hubspot" ${state.approved_for_hubspot?"checked":""}/> Approve for HubSpot export</label>
+    </div>
+    <div class="lead-mgmt-row">
+      <button class="lead-mgmt-btn" id="lm-save">Save</button>
+      <span id="lm-save-status" style="font-size:11px;color:var(--muted)"></span>
+    </div>
+    <div>
+      <textarea id="lm-note-text" placeholder="Add a note..."></textarea>
+      <button class="lead-mgmt-btn" id="lm-add-note">Add Note</button>
+    </div>
+    <div style="margin-top:10px">${notesHtml}</div>
+  </div>`;
+}
+
+function refreshLeadMgmtSection(propertyId){
+  const root = document.querySelector(`.lead-mgmt[data-property-id="${propertyId}"]`);
+  if(!root) return;
+  root.outerHTML = renderLeadMgmtHtml(propertyId);
+  wireLeadMgmt(propertyId);
+}
+
+function wireLeadMgmt(propertyId){
+  if(!propertyId || !dbCap) return;
+  const root = document.querySelector(`.lead-mgmt[data-property-id="${propertyId}"]`);
+  if(!root) return;
+
+  const saveBtn = root.querySelector("#lm-save");
+  if(saveBtn) saveBtn.addEventListener("click", async () => {
+    const suppressed = root.querySelector("#lm-suppress").checked;
+    const reason = root.querySelector("#lm-reason").value;
+    const approved = root.querySelector("#lm-hubspot").checked;
+    const status = root.querySelector("#lm-save-status");
+    status.textContent = "Saving…";
+    const now = new Date().toISOString();
+    const ok = await saveLeadState(propertyId, {
+      suppressed,
+      suppression_reason_code: suppressed ? reason : null,
+      suppressed_by: suppressed ? myId : null,
+      suppressed_at: suppressed ? now : null,
+      approved_for_hubspot: approved,
+      approved_by: approved ? myId : null,
+      approved_at: approved ? now : null,
+    });
+    status.textContent = ok ? "Saved." : "Save failed -- check edit access.";
+    if(ok) refreshLeadMgmtSection(propertyId);
+  });
+
+  const noteBtn = root.querySelector("#lm-add-note");
+  if(noteBtn) noteBtn.addEventListener("click", async () => {
+    const textEl = root.querySelector("#lm-note-text");
+    const text = textEl.value.trim();
+    if(!text) return;
+    const existing = (LEAD_STATE[propertyId] && LEAD_STATE[propertyId].notes) || [];
+    const notes = [...existing, {text, at: new Date().toISOString(), by: myId}].slice(-50);
+    const ok = await saveLeadState(propertyId, {notes});
+    if(ok) refreshLeadMgmtSection(propertyId);
+  });
 }
 
 document.getElementById("modal-close").addEventListener("click",()=>document.getElementById("modal-bg").classList.remove("open"));
@@ -805,13 +1013,50 @@ function debounce(fn,ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(
 document.getElementById("search-input").addEventListener("input", debounce(applyFilters,200));
 document.getElementById("cat-filter").addEventListener("change", applyFilters);
 document.getElementById("score-filter").addEventListener("change", applyFilters);
+document.getElementById("years-filter").addEventListener("change", applyFilters);
 document.getElementById("addr-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });
+document.getElementById("suppressed-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });
 
 let downloadsCap = null;
 (async () => {
   try { downloadsCap = await window.claude?.use?.("downloads"); } catch(e) { downloadsCap = null; }
   document.getElementById("export-csv-btn").style.display = downloadsCap ? "" : "none";
 })();
+
+// Lead-management write surface. Resolves independently of the initial
+// render -- the page must not block first paint on capability negotiation
+// -- and re-filters once state arrives.
+(async () => {
+  try { dbCap = await window.claude?.use?.("db"); } catch(e) { dbCap = null; }
+  try { userCap = await window.claude?.use?.("user"); } catch(e) { userCap = null; }
+  try { myId = userCap ? await userCap.id() : null; } catch(e) { myId = null; }
+  await loadLeadState();
+})();
+
+async function loadLeadState(){
+  if(!dbCap) return;
+  try{
+    const snap = await dbCap.collection("leads").limit(1000).get();
+    const state = {};
+    snap.docs.forEach(d => { state[d.id] = d.data(); });
+    LEAD_STATE = state;
+    applyFilters();
+  }catch(e){ console.error("lead state load failed", e); }
+}
+
+async function saveLeadState(propertyId, patch){
+  if(!dbCap || !propertyId) return false;
+  const merged = {...(LEAD_STATE[propertyId] || {}), ...patch, updated_at: new Date().toISOString()};
+  try{
+    await dbCap.doc("leads/" + propertyId).set(merged);
+    LEAD_STATE[propertyId] = merged;
+    applyFilters();
+    return true;
+  }catch(e){
+    console.error("lead state write failed", e);
+    return false;
+  }
+}
 
 function splitName(full){
   if(!full) return ["",""];
@@ -827,26 +1072,28 @@ document.getElementById("export-csv-btn").addEventListener("click", async ()=>{
   if(viewMode === "compound"){
     const cols = ["First Name","Last Name","Mailing Address","Mailing City","Mailing State",
       "Property Address","Property City","Property Zip","Tier","Distinct Distress Types",
-      "Total Filings","Distress Types","Doc Types","Max Score","Flags"];
+      "Total Filings","Distress Types","Doc Types","Max Score","Years Owned (est.)","Market Value","Flags"];
     rows = [cols.join(",")];
     filtered.forEach(g=>{
       const [first,last] = splitName(g.owner||"");
       const vals = [first,last, g.mail_address||"",g.mail_city||"",g.mail_state||"",
         g.address||"",g.prop_city||"",g.prop_zip||"", g.tier, g.distinct_cats, g.filing_count,
-        g.catLabels.join("; "), g.docTypes.join("; "), g.max_score, (g.flags||[]).join("; ")];
+        g.catLabels.join("; "), g.docTypes.join("; "), g.max_score,
+        g.years_owned??"", g.market_value||"", (g.flags||[]).join("; ")];
       rows.push(vals.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(","));
     });
   } else {
     const cols = ["First Name","Last Name","Mailing Address","Mailing City","Mailing State","Mailing Zip",
       "Property Address","Property City","Property State","Property Zip","Lead Type","Document Type",
-      "Date Filed","Document Number","Amount","Score","Flags","Source","Public Record URL"];
+      "Date Filed","Document Number","Amount","Score","Years Owned (est.)","Market Value","Flags","Source","Public Record URL"];
     rows = [cols.join(",")];
     filtered.forEach(r=>{
       const [first,last] = splitName(r.owner||"");
       const vals = [first,last, r.mail_address||"",r.mail_city||"",r.mail_state||"",r.mail_zip||"",
         r.prop_address||"",r.prop_city||"",r.prop_state||"",r.prop_zip||"",
         r.cat_label||"",r.doc_type||"",r.filed||"",r.doc_num||"",
-        r.amount||"", r.score||0, (r.flags||[]).join("; "), r.source||"", r.clerk_url||""];
+        r.amount||"", r.score||0, r.years_owned??"", r.market_value||"",
+        (r.flags||[]).join("; "), r.source||"", r.clerk_url||""];
       rows.push(vals.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(","));
     });
   }

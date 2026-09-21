@@ -54,11 +54,14 @@ Usage:
 import argparse
 import datetime
 import json
+import os
 import re
 import time
 
 import requests
 from bs4 import BeautifulSoup
+
+import duval_leads_db as db
 
 HEADERS = {
     "User-Agent": (
@@ -298,17 +301,35 @@ def zip_excluded(z):
 
 
 ENTITY_PATTERN = re.compile(
-    # \bTRUST\b covers all trusts (living, family, revocable, land, bare "<Name> Trust");
-    # LAND\s*TRUST is kept too even though it's now redundant with \bTRUST\b.
-    r"LAND\s*TRUST|\bTRUST\b|\bLLC\b|\bL\.L\.C\.?\b|\bINC\.?\b|\bCORP(?:ORATION)?\.?\b|"
+    # LAND TRUST is kept here (not with the general trust pattern below):
+    # investors use a land trust much like an LLC, to hold title without a
+    # personal name attached, so it's treated as entity-like for exclusion
+    # purposes. A bare "<Name> Trust" is very often an individual's estate
+    # plan (living/family/revocable trust) instead -- a legitimate seller,
+    # not an entity to filter out -- so it's handled separately by
+    # TRUST_PATTERN/is_trust_owned() as a review flag, not an exclusion.
+    r"LAND\s*TRUST|\bLLC\b|\bL\.L\.C\.?\b|\bINC\.?\b|\bCORP(?:ORATION)?\.?\b|"
     r"\bLP\b|\bLLP\b|\bLTD\.?\b|\bCOMPANY\b|\bHOLDINGS\b|\bENTERPRISES\b|"
     r"\bINVESTMENTS?\s*(GROUP)?\b|\bPROPERTIES\b|\bCAPITAL\b|\bVENTURES?\b",
     re.I,
 )
 
+# Trusts are NOT excluded (revocable/living/family trusts are a common,
+# legitimate estate-planning vehicle and can be exactly the probate-
+# adjacent motivated-seller situation this system exists to find). They're
+# flagged for manual authority verification instead -- see
+# TRUST_OWNERSHIP_REVIEW_REQUIRED in compute_score_flags. Do not assume a
+# beneficiary, relative, occupant, or associated person has authority to
+# sell just because their name is attached to the trust.
+TRUST_PATTERN = re.compile(r"\bTRUST\b", re.I)
+
 
 def is_entity_owned(owner_name):
     return bool(ENTITY_PATTERN.search(owner_name or ""))
+
+
+def is_trust_owned(owner_name):
+    return bool(TRUST_PATTERN.search(owner_name or ""))
 
 
 def is_unit_address(addr):
@@ -586,6 +607,9 @@ def compute_score_flags(cat, filed_date, owner_name, prop_address, mail_address,
     if ENTITY_PATTERN.search(owner_name or ""):
         flags.append("LLC / corp owner")
 
+    if is_trust_owned(owner_name):
+        flags.append("TRUST_OWNERSHIP_REVIEW_REQUIRED")
+
     if prop_address and mail_address:
         p, m = street_norm(prop_address), street_norm(mail_address)
         if p and p not in m:
@@ -711,6 +735,7 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
             "mail_state": mail_state,
             "mail_zip": mail_zip,
             "clerk_url": "https://or.duvalclerk.com/search/SearchTypeInstrumentNumber",
+            "re_number": match.get("re_number", "") or match.get("re_raw", ""),
             "flags": flags,
             "score": score,
             "source": "Duval County Clerk -- Official Records",
@@ -787,6 +812,7 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
                 "mail_state": mail_state,
                 "mail_zip": mail_zip,
                 "clerk_url": item["parcel_appraiser_url"],
+                "re_number": item["parcel_id"],
                 "flags": flags,
                 "score": score,
                 "source": "Duval County Tax Deed Auction",
@@ -812,6 +838,32 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
     return records
 
 
+def enrich_records_with_ids(conn, records):
+    """Looks up the property_id/owner_id that persist_records() just
+    assigned (deterministically, from the DB module -- the single source
+    of truth for identity), plus the confidence labels for each, and
+    merges them back into the in-memory record dicts as additive fields.
+    This does not touch, reorder, or filter `records` -- it only adds
+    keys -- so it has no effect on the accumulate-by-doc_num history
+    mechanism records.json depends on."""
+    doc_rows = conn.execute(
+        "SELECT source_name, doc_num, doc_type, property_id, owner_id FROM documents"
+    ).fetchall()
+    prop_conf = {r["id"]: r["address_match_confidence"] for r in conn.execute(
+        "SELECT id, address_match_confidence FROM properties")}
+    owner_conf = {r["id"]: r["identity_confidence"] for r in conn.execute(
+        "SELECT id, identity_confidence FROM owners")}
+    by_key = {(r["source_name"], r["doc_num"], r["doc_type"]): (r["property_id"], r["owner_id"]) for r in doc_rows}
+
+    for r in records:
+        prop_id, owner_id = by_key.get((r.get("source", ""), r.get("doc_num", ""), r.get("doc_type", "")), (None, None))
+        r["property_id"] = prop_id
+        r["owner_id"] = owner_id
+        r["address_match_confidence"] = prop_conf.get(prop_id, "unmatched")
+        r["owner_identity_confidence"] = owner_conf.get(owner_id, "unmatched")
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build records.json for the Duval County lead tracker dashboard")
     parser.add_argument("--days", type=int, default=7, help="Days of Official Records to pull (default 7)")
@@ -821,6 +873,15 @@ def main():
     parser.add_argument("--out", default="records.json")
     parser.add_argument("--fresh", action="store_true",
                          help="Ignore any existing --out file and rebuild from scratch instead of merging with prior history")
+    parser.add_argument("--db", default="data/duval_leads.db",
+                         help="Structured research/scoring SQLite layer (additive -- see duval_leads_db.py's "
+                              "module docstring for data ownership). Rebuilt from --backup on each run.")
+    parser.add_argument("--backup", default="data/backup.json",
+                         help="Full-fidelity export of the SQLite layer, git-tracked for durability")
+    parser.add_argument("--csv", default="data/export_leads.csv")
+    parser.add_argument("--hubspot-csv", default="data/hubspot_export.csv")
+    parser.add_argument("--skip-db", action="store_true",
+                         help="Scrape and write records.json only, skip the SQLite layer (debugging escape hatch)")
     args = parser.parse_args()
 
     history = {}
@@ -838,7 +899,30 @@ def main():
         except (json.JSONDecodeError, OSError) as e:
             print(f"[history] could not load prior {args.out}, starting fresh: {e}")
 
+    # `records` is the FULL accumulated set -- freshly enriched, reused
+    # from history, and carried-forward -- exactly as build_records()
+    # already assembles it. Nothing below this point changes that list's
+    # membership or the doc_num-keyed history mechanism; the SQLite layer
+    # only reads it and adds identity/confidence fields on top.
     records = build_records(args.days, args.records_delay, args.pao_delay, args.max_detail_scan, history=history)
+
+    conn = None
+    if not args.skip_db:
+        conn = db.init_db(args.db)
+        if os.path.exists(args.backup):
+            n = db.load_backup_into_db(conn, args.backup)
+            print(f"[db] Rehydrated from {args.backup} ({n} rows across all tables)")
+        elif db.is_empty(conn):
+            n = db.seed_from_records_json(conn, args.out) if os.path.exists(args.out) else 0
+            if n:
+                print(f"[db] First run -- seeded {n} legacy records from {args.out}")
+
+        run_id = db.start_run(conn, sources_run="official_records,tax_deed_auction")
+        n_persisted = db.persist_records(conn, records, run_id)
+        db.finish_run(conn, run_id, n_persisted, status="ok")
+        print(f"[db] Persisted {n_persisted} records this run (full accumulated history, not just today's pull)")
+
+        records = enrich_records_with_ids(conn, records)
 
     today = datetime.date.today()
     fetch_start = today - datetime.timedelta(days=args.days - 1)
@@ -857,8 +941,16 @@ def main():
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=None)
-
     print(f"\nWrote {len(records)} records to {args.out}")
+
+    if conn is not None:
+        db.export_backup_json(conn, args.backup)
+        print(f"[db] Wrote full backup to {args.backup}")
+        n_csv = db.export_csv(conn, args.csv)
+        print(f"[db] Wrote {n_csv} rows to {args.csv}")
+        n_hs = db.export_hubspot_csv(conn, args.hubspot_csv)
+        print(f"[db] Wrote {n_hs} HubSpot-approved rows to {args.hubspot_csv}")
+        conn.close()
 
 
 if __name__ == "__main__":
