@@ -11,6 +11,16 @@ this was modeled on) from two live Duval County sources:
   2. The next scheduled tax deed auction (duval.realtaxdeed.com) -- every
      item on it, i.e. properties about to be sold at auction.
 
+Each run merges into any existing --out file rather than replacing it: a
+record already on file (by doc_num) is reused as-is (no repeat PAO lookup)
+and carried forward even once it's outside the current --days window, so
+records.json accumulates full distress history across runs instead of
+only ever showing the last N days. This is what makes it possible to see
+how long a property/owner has had distress signals piling up -- a single
+run's "filed" dates are all recent by construction, but the accumulated
+history's span of filed dates per owner/address is a real "how long have
+they been behind" signal. Pass --fresh to rebuild from scratch instead.
+
 Each record is enriched with a property address + mailing address via
 the Property Appraiser (paopropertysearch.coj.net):
   - Official Records rows are matched by the GRANTOR name (see the
@@ -594,16 +604,48 @@ def compute_score_flags(cat, filed_date, owner_name, prop_address, mail_address,
 # ---------------------------------------------------------------------------
 
 
-def build_records(days_back, delay_records, delay_pao, max_detail_scan):
+def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=None):
+    """history maps doc_num -> a previously-built record (loaded from a prior
+    run's output). A doc_num already in history is reused as-is instead of
+    re-enriched (the filing itself is immutable once recorded, and this
+    saves a PAO lookup); any history doc_num not encountered in this run's
+    fetch window is carried forward unchanged so old records.json entries
+    outside the last `days_back` days aren't lost. Every record -- reused,
+    freshly enriched, or carried forward -- is re-run through the current
+    exclusion filters, so a filtering-rule change also cleans up history."""
+    history = history or {}
     session = new_pao_session()
     records = []
     seen_doc_nums = set()
+
+    def keep(record):
+        return (
+            not zip_excluded(record["prop_zip"])
+            and not is_entity_owned(record["owner"])
+            and not is_unit_address(record["prop_address"])
+        )
+
+    def take(doc_num, record):
+        if not doc_num or doc_num in seen_doc_nums:
+            if doc_num:
+                print(f"[dedup] skipped duplicate doc_num {doc_num}")
+            return
+        seen_doc_nums.add(doc_num)
+        if keep(record):
+            records.append(record)
 
     # -- Official Records --
     raw = fetch_distress_records(days_back, delay=delay_records)
     print(f"[records] {len(raw)} distress-category official records to enrich")
     cache = {}
+    new_count = 0
     for i, r in enumerate(raw, 1):
+        doc_num = r.get("InstrumentNumber", "")
+        if doc_num and doc_num in history:
+            take(doc_num, history[doc_num])
+            continue
+        new_count += 1
+
         cat, cat_label = CATEGORY_MAP.get((r.get("DocTypeDescription") or "").upper(), ("other", r.get("DocTypeDescription", "")))
         owner_field = OWNER_FIELD_BY_CAT.get(cat, "DirectName")
         other_field = "IndirectName" if owner_field == "DirectName" else "DirectName"
@@ -651,7 +693,7 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
                 pass
 
         record = {
-            "doc_num": r.get("InstrumentNumber", ""),
+            "doc_num": doc_num,
             "doc_type": r.get("DocTypeDescription", ""),
             "filed": filed,
             "cat": cat,
@@ -676,16 +718,8 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
             "last_sale_date": last_sale_date,
             "years_owned": years_owned,
         }
-        if (
-            not zip_excluded(record["prop_zip"])
-            and not is_entity_owned(record["owner"])
-            and not is_unit_address(record["prop_address"])
-        ):
-            if record["doc_num"] in seen_doc_nums:
-                print(f"[dedup] skipped duplicate doc_num {record['doc_num']}")
-            else:
-                seen_doc_nums.add(record["doc_num"])
-                records.append(record)
+        take(doc_num, record)
+    print(f"[records] {new_count} newly enriched, {len(raw) - new_count} reused from history")
 
     # -- Tax deed auction --
     auction_date = None
@@ -699,6 +733,11 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
         items = fetch_taxdeed_auction(auction_date)
         print(f"[taxdeed] {len(items)} items to enrich")
         for i, item in enumerate(items, 1):
+            doc_num = item["case_number"]
+            if doc_num and doc_num in history:
+                take(doc_num, history[doc_num])
+                continue
+
             re_raw = item["parcel_id"].replace("-", "")
             print(f"[pao {i}/{len(items)}] RE# {item['parcel_id']}")
             detail = {}
@@ -730,7 +769,7 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
                     pass
 
             record = {
-                "doc_num": item["case_number"],
+                "doc_num": doc_num,
                 "doc_type": "TAX DEED",
                 "filed": auction_date.replace("/", "-") if auction_date else "",
                 "cat": "tax",
@@ -755,16 +794,20 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan):
                 "last_sale_date": last_sale_date,
                 "years_owned": years_owned,
             }
-            if (
-                not zip_excluded(record["prop_zip"])
-                and not is_entity_owned(record["owner"])
-                and not is_unit_address(record["prop_address"])
-            ):
-                if record["doc_num"] in seen_doc_nums:
-                    print(f"[dedup] skipped duplicate doc_num {record['doc_num']}")
-                else:
-                    seen_doc_nums.add(record["doc_num"])
-                    records.append(record)
+            take(doc_num, record)
+
+    # Carry forward history records untouched this run -- e.g. aged out of
+    # the fetch window, or the tax deed site was unreachable -- so previously
+    # discovered leads aren't lost just because they didn't reappear today.
+    carried = 0
+    for doc_num, record in history.items():
+        if doc_num in seen_doc_nums:
+            continue
+        seen_doc_nums.add(doc_num)
+        if keep(record):
+            records.append(record)
+            carried += 1
+    print(f"[history] carried forward {carried} previously-seen records outside this run's fetch window")
 
     return records
 
@@ -776,16 +819,37 @@ def main():
     parser.add_argument("--pao-delay", type=float, default=0.4)
     parser.add_argument("--max-detail-scan", type=int, default=40)
     parser.add_argument("--out", default="records.json")
+    parser.add_argument("--fresh", action="store_true",
+                         help="Ignore any existing --out file and rebuild from scratch instead of merging with prior history")
     args = parser.parse_args()
 
-    records = build_records(args.days, args.records_delay, args.pao_delay, args.max_detail_scan)
+    history = {}
+    if not args.fresh:
+        try:
+            with open(args.out, "r", encoding="utf-8") as f:
+                prior = json.load(f)
+            for rec in prior.get("records", []):
+                doc_num = rec.get("doc_num")
+                if doc_num:
+                    history[doc_num] = rec
+            print(f"[history] loaded {len(history)} previously-seen records from {args.out}")
+        except FileNotFoundError:
+            pass
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[history] could not load prior {args.out}, starting fresh: {e}")
+
+    records = build_records(args.days, args.records_delay, args.pao_delay, args.max_detail_scan, history=history)
 
     today = datetime.date.today()
-    start = today - datetime.timedelta(days=args.days - 1)
+    fetch_start = today - datetime.timedelta(days=args.days - 1)
+    iso_filed = [r["filed"] for r in records if re.fullmatch(r"\d{4}-\d{2}-\d{2}", r.get("filed") or "")]
+    range_from = min(iso_filed) if iso_filed else fetch_start.isoformat()
+    range_to = max(iso_filed) if iso_filed else today.isoformat()
+
     payload = {
         "fetched_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "source": "Duval County Clerk + Property Appraiser + Tax Deed Auction",
-        "date_range": {"from": start.isoformat(), "to": today.isoformat()},
+        "date_range": {"from": range_from, "to": range_to},
         "total": len(records),
         "with_address": sum(1 for r in records if r.get("prop_address")),
         "records": records,
