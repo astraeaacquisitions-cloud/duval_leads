@@ -1,3 +1,10 @@
 scraper_run.log
 records.json
 __pycache__/
+*.pyc
+
+# Derived/regenerable, and today just test-run output -- not yet real
+# accumulated production history. backup.json becomes the git-tracked
+# durable copy (per README's data-ownership table) once this runs for
+# real; committing today's test data would be misleading.
+data/
