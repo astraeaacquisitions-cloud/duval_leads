@@ -1,0 +1,21 @@
+{
+  "_comment": "Phase 9 outreach angle -- a rule-based conversation starter assembled ONLY from signals this pipeline already computed (Phases 2-8), never free-form generated text and never a claim about the owner's personal situation beyond what the recorded documents show. This is a starting point for a human caller to verify and adapt, not a script -- see README's compliance note. Fragments are combined, not first-match-wins, since several conditions often apply to the same lead (e.g. an out-of-state landlord with chronic code violations).",
+
+  "review_required_prefix": "Confirm the actual decision-maker before discussing terms -- the named party may not have authority to sell.",
+
+  "fragments": {
+    "tax_imminent": "Tax deed auction is imminent -- lead with urgency and certainty of a fast, guaranteed closing.",
+    "foreclosure_judgment": "Foreclosure judgment entered -- Florida law typically schedules the sale within weeks; lead with speed and closing certainty.",
+    "code_repeat": "Chronic code violations suggest deferred maintenance -- an as-is cash offer removes the repair burden.",
+    "landlord_multi_distress": "Portfolio owner facing distress on more than one property -- lead with a simple, low-effort exit for this one.",
+    "absentee_out_of_state": "Owner's mailing address is out of state -- lead with convenience and not having to manage the property remotely."
+  },
+
+  "tier_baseline": {
+    "A": "Strong overall lead -- prioritize a direct call.",
+    "B": "Solid lead -- worth a prompt call.",
+    "C": "Moderate lead -- worth a call, verify details first.",
+    "D": "Lower priority -- research further before contacting.",
+    "E": "Low priority -- confirm the data checks out before spending outreach time here."
+  }
+}

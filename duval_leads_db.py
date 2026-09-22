@@ -305,6 +305,7 @@ CREATE TABLE IF NOT EXISTS scores (
     contact_priority_score INTEGER,
     tier TEXT,
     tier_reason TEXT,
+    outreach_angle TEXT,
     weights_version TEXT,
     scrape_run_id TEXT
 );
@@ -396,6 +397,7 @@ SCHEMA_MIGRATIONS = [
     ("scores", "distress_reason", "TEXT"),
     ("scores", "urgency_reason", "TEXT"),
     ("scores", "confidence_reason", "TEXT"),
+    ("scores", "outreach_angle", "TEXT"),
 ]
 
 
@@ -1556,6 +1558,77 @@ def compute_contact_priority_and_tier(dealability_score, distress_score, urgency
     return score, tier, reason
 
 
+# ---------------------------------------------------------------------------
+# Phase 9: outreach angle -- HubSpot enrichment and the sync loop back
+# from the dashboard.
+#
+# A rule-based conversation starter, assembled ONLY from signals already
+# computed in Phases 2-8 -- never free-form generated text, never a claim
+# about the owner's personal situation beyond what the recorded documents
+# show. It's a starting point for a human caller to verify and adapt,
+# never a script -- see README's compliance note.
+# ---------------------------------------------------------------------------
+
+OUTREACH_ANGLES_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "outreach_angles.json"
+)
+
+
+def load_outreach_angles_config(path=OUTREACH_ANGLES_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+OUTREACH_ANGLES_CONFIG = load_outreach_angles_config()
+
+
+def compute_outreach_angle(conn, property_id, tier, config=None):
+    """Returns a short suggested-approach string. Combines every
+    applicable fragment (not first-match-wins) since several conditions
+    often apply to the same lead at once, always leading with the
+    review-required caveat when one applies -- that's a compliance fact
+    to confirm before any pitch, never optional."""
+    config = config if config is not None else OUTREACH_ANGLES_CONFIG
+    frag = config.get("fragments", {})
+
+    val = conn.execute(
+        "SELECT tax_deed_stage, foreclosure_stage, code_enforcement_stage, "
+        "landlord_portfolio_stage, absentee_stage FROM valuations WHERE property_id=?",
+        (property_id,),
+    ).fetchone()
+
+    flags_rows = conn.execute(
+        "SELECT flags_json FROM documents WHERE property_id=?", (property_id,)
+    ).fetchall()
+    all_flags = set()
+    for fr in flags_rows:
+        try:
+            all_flags.update(json.loads(fr["flags_json"] or "[]"))
+        except (ValueError, TypeError):
+            pass
+
+    parts = []
+    if all_flags & {"TRUST_OWNERSHIP_REVIEW_REQUIRED", "PROBATE_REPRESENTATIVE_REVIEW_REQUIRED"}:
+        parts.append(config.get("review_required_prefix", ""))
+
+    if val:
+        if val["tax_deed_stage"] in ("TAX_STAGE_IMMINENT", "TAX_STAGE_PAST_UNVERIFIED"):
+            parts.append(frag.get("tax_imminent", ""))
+        elif val["foreclosure_stage"] == "FORECLOSURE_STAGE_JUDGMENT_ENTERED":
+            parts.append(frag.get("foreclosure_judgment", ""))
+        if val["code_enforcement_stage"] == "CODE_STAGE_REPEAT":
+            parts.append(frag.get("code_repeat", ""))
+        if val["landlord_portfolio_stage"] == "LANDLORD_STAGE_MULTI_PROPERTY_DISTRESS":
+            parts.append(frag.get("landlord_multi_distress", ""))
+        if val["absentee_stage"] == "ABSENTEE_STAGE_OUT_OF_STATE":
+            parts.append(frag.get("absentee_out_of_state", ""))
+
+    if not parts:
+        parts.append(config.get("tier_baseline", {}).get(tier, ""))
+
+    return " ".join(p for p in parts if p)
+
+
 def compute_dealability_for_all_properties(conn, run_id, config=None):
     """Runs after persist_records() for the run. Re-scores every property
     on file, not just ones touched this run -- cheap (pure SQL, no
@@ -1599,14 +1672,15 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
              absentee_stage, landlord_stage, portfolio_count, portfolio_distressed_count,
              "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN", ts, property_id),
         )
+        outreach_angle = compute_outreach_angle(conn, property_id, tier)
         conn.execute(
             "INSERT INTO scores (property_id, computed_at, distress_score, distress_reason, "
             "urgency_score, urgency_reason, dealability_score, dealability_reason, "
             "confidence_score, confidence_reason, contact_priority_score, tier, tier_reason, "
-            "weights_version, scrape_run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "outreach_angle, weights_version, scrape_run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (property_id, ts, distress_score, distress_reason, urgency_score, urgency_reason,
              score, reason, confidence_score, confidence_reason, contact_priority_score, tier, tier_reason,
-             "phase8-v1", run_id),
+             outreach_angle, "phase9-v1", run_id),
         )
         if score >= tier2_threshold:
             _add_research_task_if_absent(
@@ -1668,6 +1742,40 @@ def merge_dashboard_state(conn, suppressions=None, contacts=None, overrides=None
     return n
 
 
+def sync_dashboard_leads_state(conn, leads_by_property_id):
+    """Adapts the dashboard's `leads/{property_id}` artifact-db documents
+    (keyed by property_id, shaped exactly as duval_dashboard.html's
+    saveLeadState() writes them: suppressed/suppression_reason_code/
+    suppressed_by/suppressed_at/approved_for_hubspot/approved_by/
+    approved_at) into merge_dashboard_state()'s expected shape and
+    applies them.
+
+    This is the other half of the loop Phase 1 designed but never wired
+    up: dashboard approvals and suppressions only ever lived in the
+    artifact's own database until something calls this. There's no
+    automated trigger for it -- the standalone scraper process has no
+    browser/JS context to read the artifact's `db` capability from, so
+    this has to be run from a session that can (see
+    sync_hubspot_approvals.py, and README's 'Data ownership' table)."""
+    suppressions = []
+    hubspot_approvals = []
+    for property_id, doc in (leads_by_property_id or {}).items():
+        if doc.get("suppressed"):
+            suppressions.append({
+                "entity_type": "property", "entity_id": property_id,
+                "reason_code": doc.get("suppression_reason_code") or "OTHER",
+                "created_by": doc.get("suppressed_by", ""),
+                "created_at": doc.get("suppressed_at", now_iso()),
+            })
+        if doc.get("approved_for_hubspot"):
+            hubspot_approvals.append({
+                "entity_type": "property", "entity_id": property_id,
+                "approved_by": doc.get("approved_by", ""),
+                "approved_at": doc.get("approved_at", now_iso()),
+            })
+    return merge_dashboard_state(conn, suppressions=suppressions, hubspot_approvals=hubspot_approvals)
+
+
 # ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
@@ -1726,7 +1834,7 @@ def export_csv(conn, path):
         "v.absentee_stage, v.landlord_portfolio_stage, v.portfolio_property_count, v.portfolio_distressed_count, "
         "sc.distress_score, sc.distress_reason, sc.urgency_score, sc.urgency_reason, "
         "sc.dealability_score, sc.confidence_score, sc.confidence_reason, "
-        "sc.contact_priority_score, sc.tier, sc.tier_reason "
+        "sc.contact_priority_score, sc.tier, sc.tier_reason, sc.outreach_angle "
         "FROM documents d "
         "LEFT JOIN properties p ON p.id = d.property_id "
         "LEFT JOIN owners o ON o.id = d.owner_id "
@@ -1749,6 +1857,7 @@ def export_csv(conn, path):
             "Absentee Owner Stage", "Landlord Portfolio Stage", "Portfolio Property Count", "Portfolio Distressed Count",
             "Dealability Score", "Distress Score", "Distress Reason", "Urgency Score", "Urgency Reason",
             "Confidence Score", "Confidence Reason", "Contact Priority Score", "Tier", "Tier Reason",
+            "Suggested Outreach Angle",
             "Suppressed", "Category", "Document Type", "Filed Date",
             "Document Number", "Amount", "Legal Description", "Flags", "Legacy Score", "Source",
             "First Seen", "Last Seen"]
@@ -1791,6 +1900,7 @@ def export_csv(conn, path):
                 r["contact_priority_score"] if r["contact_priority_score"] is not None else "",
                 r["tier"] or "",
                 r["tier_reason"] or "",
+                r["outreach_angle"] or "",
                 "yes" if r["property_id"] in suppressed_props else "no",
                 r["cat"] or "", r["doc_type"] or "", r["filed_date"] or "", r["doc_num"] or "",
                 r["amount"] or "", r["legal_desc"] or "",
@@ -1803,20 +1913,43 @@ def export_csv(conn, path):
 def export_hubspot_csv(conn, path):
     """Only rows explicitly approved via hubspot_export_flags. Nothing is
     ever included here automatically -- this is the gate that keeps raw,
-    low-confidence scrape data out of the CRM."""
+    low-confidence scrape data out of the CRM. Note: hubspot_export_flags
+    only reflects what's been synced from the dashboard's own database --
+    see sync_hubspot_approvals.py; a scraper run alone never populates it.
+
+    Phase 9 adds the lead-scoring context (Dealability/Distress/Urgency/
+    Confidence/Tier/Contact Priority, key review flags, and the rule-based
+    outreach angle) as extra columns so a rep importing this into HubSpot
+    isn't starting from a bare name and address -- map these to custom
+    properties in HubSpot's import wizard."""
     rows = conn.execute(
         "SELECT h.entity_type, h.entity_id, h.approved_by, h.approved_at, "
         "p.re_number, p.situs_address, p.situs_city, p.situs_state, p.situs_zip, "
-        "o.display_name, o.mailing_address, o.mailing_city, o.mailing_state, o.mailing_zip "
+        "o.display_name, o.mailing_address, o.mailing_city, o.mailing_state, o.mailing_zip, "
+        "sc.dealability_score, sc.distress_score, sc.urgency_score, sc.confidence_score, "
+        "sc.contact_priority_score, sc.tier, sc.tier_reason, sc.outreach_angle "
         "FROM hubspot_export_flags h "
         "LEFT JOIN properties p ON p.id = h.entity_id AND h.entity_type='property' "
         "LEFT JOIN owners o ON o.id = h.entity_id AND h.entity_type='owner' "
+        "LEFT JOIN (SELECT s1.* FROM scores s1 INNER JOIN "
+        " (SELECT property_id, MAX(computed_at) AS max_ts FROM scores GROUP BY property_id) latest "
+        " ON s1.property_id = latest.property_id AND s1.computed_at = latest.max_ts) sc "
+        " ON sc.property_id = h.entity_id AND h.entity_type='property' "
         "WHERE h.approved_by IS NOT NULL AND h.approved_by != ''"
     ).fetchall()
+
+    flags_by_property = {}
+    for fr in conn.execute("SELECT property_id, flags_json FROM documents WHERE property_id IS NOT NULL"):
+        try:
+            flags_by_property.setdefault(fr["property_id"], set()).update(json.loads(fr["flags_json"] or "[]"))
+        except (ValueError, TypeError):
+            pass
 
     cols = ["First Name", "Last Name", "Company Name (if entity)", "Mailing Address", "Mailing City",
             "Mailing State", "Mailing Zip", "Property Address", "Property City", "Property State",
             "Property Zip", "Property RE#", "Lead Source", "External Property ID", "External Owner ID",
+            "Dealability Score", "Distress Score", "Urgency Score", "Confidence Score",
+            "Contact Priority Score", "Tier", "Tier Reason", "Suggested Outreach Angle", "Key Flags",
             "Approved By", "Approved At"]
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -1827,6 +1960,8 @@ def export_hubspot_csv(conn, path):
             display_name = r["display_name"] or ""
             first, last = ("", "") if not display_name else _split_name(display_name)
             is_entity_name = display_name if (first == "" and last == display_name and " " not in display_name) else ""
+            prop_id = r["entity_id"] if r["entity_type"] == "property" else None
+            flags = "; ".join(sorted(flags_by_property.get(prop_id, set()))) if prop_id else ""
             w.writerow([
                 first, last, is_entity_name, r["mailing_address"] or "", r["mailing_city"] or "",
                 r["mailing_state"] or "", r["mailing_zip"] or "",
@@ -1834,6 +1969,12 @@ def export_hubspot_csv(conn, path):
                 r["re_number"] or "", "Duval County Distress Docket",
                 r["entity_id"] if r["entity_type"] == "property" else "",
                 r["entity_id"] if r["entity_type"] == "owner" else "",
+                r["dealability_score"] if r["dealability_score"] is not None else "",
+                r["distress_score"] if r["distress_score"] is not None else "",
+                r["urgency_score"] if r["urgency_score"] is not None else "",
+                r["confidence_score"] if r["confidence_score"] is not None else "",
+                r["contact_priority_score"] if r["contact_priority_score"] is not None else "",
+                r["tier"] or "", r["tier_reason"] or "", r["outreach_angle"] or "", flags,
                 r["approved_by"] or "", r["approved_at"] or "",
             ])
     return len(rows)

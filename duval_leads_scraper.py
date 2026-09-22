@@ -1041,7 +1041,7 @@ def enrich_records_with_ids(conn, records, run_id=None):
         scores = {r["property_id"]: r for r in conn.execute(
             "SELECT property_id, dealability_score, dealability_reason, "
             "distress_score, distress_reason, urgency_score, urgency_reason, "
-            "confidence_score, confidence_reason, contact_priority_score, tier, tier_reason "
+            "confidence_score, confidence_reason, contact_priority_score, tier, tier_reason, outreach_angle "
             "FROM scores WHERE scrape_run_id=?",
             (run_id,))}
     by_key = {(r["source_name"], r["doc_num"], r["doc_type"]): (r["property_id"], r["owner_id"]) for r in doc_rows}
@@ -1095,6 +1095,7 @@ def enrich_records_with_ids(conn, records, run_id=None):
         r["contact_priority_score"] = sc["contact_priority_score"] if sc else None
         r["tier"] = sc["tier"] if sc else None
         r["tier_reason"] = sc["tier_reason"] if sc else ""
+        r["outreach_angle"] = sc["outreach_angle"] if sc else ""
     return records
 
 

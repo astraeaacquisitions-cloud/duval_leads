@@ -585,6 +585,7 @@ function computeCompoundGroups(records){
       contact_priority_score: bestPriority.contact_priority_score ?? null,
       lead_tier: bestPriority.tier || null,
       tier_reason: bestPriority.tier_reason || "",
+      outreach_angle: bestPriority.outreach_angle || "",
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -1150,6 +1151,11 @@ function stackedDistressHtml(r){
       </div>
       ${r.tier_reason?`<div class="dealability-reason">${r.tier_reason}</div>`:""}
       ${[r.distress_reason, r.urgency_reason, r.confidence_reason].filter(Boolean).map(x=>`<div style="font-size:11px;color:var(--muted2);margin-top:6px">• ${x}</div>`).join("")}
+      ${r.outreach_angle?`<div style="margin-top:10px">
+        <label style="display:block;font-size:9.5px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px">Suggested Outreach Angle</label>
+        <div style="font-size:12px;font-style:italic">${r.outreach_angle}</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:4px">A rule-based starting point from the signals above -- verify and adapt before contacting anyone, not a script.</div>
+      </div>`:""}
     </div>
   `;
 }

@@ -40,6 +40,14 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
 - `config/stacked_distress_weights.json` -- Phase 8 distress/urgency/
   confidence weights, the contact-priority blend, the low-confidence
   cap, and the A-E tier cutoffs.
+- `sync_hubspot_approvals.py` -- Phase 9, explicit hand-run sync tool
+  that applies a JSON dump of the dashboard's `leads` collection (fetch
+  with the ArtifactData tool) into SQLite, so `export_hubspot_csv()`
+  reflects what was actually approved. Same "throwaway `--db` first"
+  discipline as `import_history_to_sqlite.py`.
+- `config/outreach_angles.json` -- Phase 9 rule-based outreach-angle
+  templates. Edit to change the suggested talking points -- no code
+  changes needed.
 
 ## Property-type classification (Phase 2)
 
@@ -402,6 +410,67 @@ both the single-filing and Compound Distress modals, and a compact
 "Priority" column (the A-E badge) sortable by `contact_priority_score`
 in both table views.
 
+## HubSpot Export & Outreach (Phase 9)
+
+**What this phase actually is: an import-ready CSV, not a live push.**
+This environment has no HubSpot API key or MCP connector configured, so
+there is no live HubSpot integration to build against -- claiming one
+would violate the same "never claim data or capability we don't have"
+discipline every earlier phase followed. What Phase 9 delivers instead:
+a CSV shaped for HubSpot's own contact-import wizard, gated by the same
+explicit-approval rule the pipeline has had since Phase 1, now actually
+wired end to end and enriched with the Phase 3-8 scoring context.
+
+**The gap this phase closes.** The dashboard's "Approve for HubSpot
+export" checkbox has always written straight to the published artifact's
+own `db` capability (a `leads/{property_id}` document per property) --
+that's documented in "Data ownership" below as a convenience write
+surface, "intended to be synced into the durable database on each
+scheduled run." Nothing ever did that sync: `merge_dashboard_state()`
+existed in `duval_leads_db.py` since Phase 1 but nothing called it, so
+`hubspot_export_flags` -- and therefore `export_hubspot_csv()` -- stayed
+permanently empty no matter what got approved in the dashboard. Phase 9
+adds the other half: `duval_leads_db.sync_dashboard_leads_state()`
+adapts the dashboard's `leads` collection into `merge_dashboard_state()`'s
+shape, and `sync_hubspot_approvals.py` is the explicit, hand-run script
+that applies it -- same pattern and same "test against a throwaway `--db`
+first" discipline as `import_history_to_sqlite.py`. This has to be a
+deliberate step, not an automatic one: the standalone scraper process is
+plain Python with no browser/JS context, so it cannot read the artifact's
+`db` capability itself -- only a session with the `ArtifactData` tool
+(fetching the published dashboard's `leads` collection) can produce the
+JSON file this script consumes.
+
+**What the export now includes.** `export_hubspot_csv()` still only
+ever includes rows with an explicit `approved_by` -- nothing changed
+about that gate -- but each row now also carries the full Phase 3-8
+picture: Dealability/Distress/Urgency/Confidence/Contact Priority
+scores, Tier, the plain-language Tier Reason, every review/portfolio/
+absentee flag on file, and the outreach angle described below. Map
+these to HubSpot custom properties in the import wizard so a rep isn't
+starting from a bare name and address.
+
+**Suggested Outreach Angle** (`compute_outreach_angle()`) is a rule-
+based conversation starter assembled ONLY from signals this pipeline
+already computed -- never free-form generated text, and never a claim
+about the owner's personal situation beyond what the recorded documents
+show. It combines every applicable fragment (an out-of-state landlord
+with chronic code violations gets both angles, not just one), always
+leading with the review-required caveat when
+`TRUST_OWNERSHIP_REVIEW_REQUIRED` or
+`PROBATE_REPRESENTATIVE_REVIEW_REQUIRED` applies -- confirming the real
+decision-maker is a compliance fact to check before any pitch, never
+optional. Falls back to a tier-based baseline when no specific signal
+applies. Templates live in `config/outreach_angles.json`, fully
+editable without code changes.
+
+**Compliance note:** this is a starting point for a human caller to
+verify and adapt, never a script to read verbatim, and never a basis
+for claiming to know something about the owner that isn't actually in
+the record (their motivation, health, marital status, finances beyond
+what's recorded, etc.). The dashboard's own modal repeats this caveat
+next to every angle it shows.
+
 ## Data ownership
 
 Several systems now hold overlapping pieces of the same picture. As of
@@ -411,7 +480,7 @@ this Phase 1 reconciliation, here is which one is authoritative for what:
 |---|---|---|
 | Operational lead/contact history (which distress filings exist, accumulated across runs) | `records.json`'s own accumulate-by-`doc_num` mechanism (in `duval_leads_scraper.py`) | The dashboard's only input. `--fresh` rebuilds it from scratch; otherwise every run merges into the existing file. **`records.json` is gitignored -- it only persists as long as the same container/disk does.** |
 | Stable property/owner identity, evidence confidence, audit history of every run, export preparation | SQLite (`duval_leads_db.py`), durable via the git-tracked `data/backup.json` | Additive only. Reads the same accumulated `records` list the scraper already builds and layers structured fields on top (`property_id`, `owner_id`, `re_number`, confidence labels) -- it does not filter, reorder, or feed back into what `records.json` contains. |
-| Qualified/contacted leads, conversations, follow-ups, deal pipeline | HubSpot (Phase 9, not yet built) | Only records explicitly approved via the dashboard's "Approve for HubSpot" control are ever exported -- never the raw scrape. |
+| Qualified/contacted leads, conversations, follow-ups, deal pipeline | HubSpot (via manual CSV import, Phase 9) | No live API/connector is configured in this environment, so there is no automatic push -- `export_hubspot_csv()` produces an import-ready file. Only records explicitly approved via the dashboard's "Approve for HubSpot" control are ever included -- never the raw scrape -- and that approval only reaches the CSV after `sync_hubspot_approvals.py` runs (see "HubSpot Export & Outreach" above). |
 | Portable backup, manual editing, recovery | CSV exports (`data/export_leads.csv`, `data/hubspot_export.csv`) and `data/backup.json` | Regenerable from SQLite at any time; `backup.json` is the one that's git-tracked and therefore the actual disaster-recovery copy. |
 | Suppression flags, notes, HubSpot-approval marks made from the dashboard | The published artifact's `db` capability (`leads/{property_id}` docs) | A convenience write surface, not a vault -- intended to be synced into the durable database on each scheduled run, not treated as the only copy. |
 
