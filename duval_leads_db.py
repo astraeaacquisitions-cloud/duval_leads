@@ -267,6 +267,8 @@ CREATE TABLE IF NOT EXISTS valuations (
     equity_signal TEXT,
     equity_confidence TEXT,
     equity_reasoning TEXT,
+    tax_deed_stage TEXT,
+    days_until_tax_sale INTEGER,
     computed_at TEXT
 );
 
@@ -364,6 +366,8 @@ SCHEMA_MIGRATIONS = [
     ("properties", "property_type_decision", "TEXT"),
     ("properties", "year_built", "INTEGER"),
     ("properties", "building_count", "INTEGER"),
+    ("valuations", "tax_deed_stage", "TEXT"),
+    ("valuations", "days_until_tax_sale", "INTEGER"),
 ]
 
 
@@ -764,11 +768,97 @@ def compute_equity_signal(years_owned, last_sale_price, market_value, config=Non
     return "LIKELY_LIMITED", "INFERRED", reason, bool(appreciated)
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: tax-deed timeline.
+#
+# Built entirely from the one verified date this pipeline actually
+# scrapes -- the scheduled tax deed auction date from
+# duval.realtaxdeed.com (documents.filed_date for doc_type='TAX DEED').
+# Florida's real tax process has earlier stages (delinquency, certificate
+# sale, the 2-year certificate-holder eligibility window) that this
+# pipeline does not scrape a source for, so they are never claimed here --
+# a property with no scheduled auction on file is TAX_STAGE_NONE, not
+# assumed current on its taxes.
+# ---------------------------------------------------------------------------
+
+TAX_TIMELINE_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "tax_timeline.json"
+)
+
+
+def load_tax_timeline_config(path=TAX_TIMELINE_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+TAX_TIMELINE_CONFIG = load_tax_timeline_config()
+
+
+def _parse_taxdeed_date(s):
+    """Parses the scraper's MM-DD-YYYY auction date string (guaranteed by
+    the \\d{2}/\\d{2}/\\d{4} regex that produced it upstream, not
+    free-form scraped text). Returns a date or None."""
+    if not s:
+        return None
+    try:
+        return datetime.datetime.strptime(s, "%m-%d-%Y").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_tax_deed_timeline(conn, property_id, config=None, today=None):
+    """Returns (stage, days_until_sale, runway_points, reasoning) for one
+    property. `days_until_sale` is None when no scheduled auction is on
+    file (TAX_STAGE_NONE) or its date didn't parse, negative once the
+    scheduled date has passed (outcome not tracked by this pipeline --
+    flagged for manual verification, not assumed sold)."""
+    config = config if config is not None else TAX_TIMELINE_CONFIG
+    today = today or datetime.date.today()
+    rp = config.get("runway_points", {})
+
+    row = conn.execute(
+        "SELECT filed_date FROM documents WHERE property_id=? AND doc_type='TAX DEED' "
+        "ORDER BY last_seen_at DESC LIMIT 1",
+        (property_id,),
+    ).fetchone()
+    if not row or not row["filed_date"]:
+        return "TAX_STAGE_NONE", None, rp.get("none", 15), (
+            "No scheduled tax deed auction on file for this property -- this component stays a "
+            "neutral placeholder (Phase 5 adds the foreclosure timeline for non-tax leads)."
+        )
+
+    auction_date = _parse_taxdeed_date(row["filed_date"])
+    if auction_date is None:
+        return "TAX_STAGE_NONE", None, rp.get("none", 15), (
+            f"Tax deed record on file but its auction date ({row['filed_date']!r}) didn't parse -- "
+            "treating as unknown rather than guessing."
+        )
+
+    days = (auction_date - today).days
+    if days < 0:
+        return "TAX_STAGE_PAST_UNVERIFIED", days, rp.get("past_unverified", 0), (
+            f"Scheduled auction date ({auction_date.isoformat()}) has passed -- outcome (sold, redeemed, "
+            "postponed) isn't tracked by this pipeline; verify manually before treating this as a live deal."
+        )
+    if days <= config.get("imminent_days", 30):
+        return "TAX_STAGE_IMMINENT", days, rp.get("imminent", 4), (
+            f"Tax deed auction in {days} day{'s' if days != 1 else ''} ({auction_date.isoformat()}) -- "
+            "very little time to close before the county sells it; verify closing feasibility now."
+        )
+    if days <= config.get("soon_days", 90):
+        return "TAX_STAGE_SOON", days, rp.get("soon", 12), (
+            f"Tax deed auction in {days} days ({auction_date.isoformat()}) -- workable but a tightening window to close."
+        )
+    return "TAX_STAGE_FAR", days, rp.get("far", 20), (
+        f"Tax deed auction in {days} days ({auction_date.isoformat()}) -- ample time to close before the county sells it."
+    )
+
+
 def compute_dealability_score(conn, property_id, config=None):
     """Computes the Dealability Score (0-100) for one property from
     what's already in the database -- no network calls. Returns
     (score, reason, equity_signal, equity_confidence, equity_reasoning,
-    active_lien_count, has_tax_distress)."""
+    active_lien_count, has_tax_distress, tax_deed_stage, days_until_tax_sale)."""
     config = config if config is not None else DEALABILITY_CONFIG
     mp = config.get("max_points", {})
     reasons = []
@@ -872,10 +962,14 @@ def compute_dealability_score(conn, property_id, config=None):
     reasons.append(f"Value reliability: {value_points}/{mp.get('reliable_value_estimate',10)} -- "
                     f"{'PAO market/assessed value on file' if market_value else 'no PAO value found for this property'}.")
 
-    # -- Closing runway: placeholder pending Phase 4/5 timeline engines --
-    runway_points = config.get("closing_runway", {}).get("default_points", 15)
-    reasons.append(f"Closing runway: {runway_points}/{mp.get('closing_runway',20)} -- no verified deadline data yet "
-                    f"(Phase 4/5 will replace this placeholder with real tax-deed/foreclosure countdowns).")
+    # -- Closing runway: Phase 4 real countdown for tax-deed leads (built
+    # from the scraped auction date, no network call); still a neutral
+    # placeholder for every other lead pending Phase 5's foreclosure
+    # timeline (TAX_STAGE_NONE covers both cases -- no tax-deed document
+    # on file for this property, or that document's date didn't parse).
+    tax_stage, days_until_tax_sale, runway_points, runway_reason = compute_tax_deed_timeline(conn, property_id)
+    runway_points = min(runway_points, mp.get("closing_runway", 20))
+    reasons.append(f"Closing runway: {runway_points}/{mp.get('closing_runway',20)} -- {runway_reason}")
 
     # A hard cap for confirmed negative equity is intentionally not wired
     # in yet: no data source here actually confirms negative equity (that
@@ -884,7 +978,8 @@ def compute_dealability_score(conn, property_id, config=None):
     # penalizing a guess as if it were a fact. Revisit once Tier 2 lands.
     total = max(0, min(100, equity_points + lien_points + owner_points + fits_points + value_points + runway_points))
     reason = " | ".join(reasons)
-    return total, reason, signal, eq_conf, eq_reason, active_lien_count, has_tax_distress
+    return (total, reason, signal, eq_conf, eq_reason, active_lien_count, has_tax_distress,
+            tax_stage, days_until_tax_sale)
 
 
 def compute_dealability_for_all_properties(conn, run_id, config=None):
@@ -901,14 +996,15 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
     tier2_threshold = config.get("tier2_mortgage_lookup_threshold", 50)
     property_ids = [r["id"] for r in conn.execute("SELECT id FROM properties")]
     for property_id in property_ids:
-        score, reason, signal, eq_conf, eq_reason, lien_count, has_tax = compute_dealability_score(
-            conn, property_id, config
-        )
+        (score, reason, signal, eq_conf, eq_reason, lien_count, has_tax,
+         tax_stage, days_until_tax_sale) = compute_dealability_score(conn, property_id, config)
         conn.execute(
             "UPDATE valuations SET active_lien_count=?, has_tax_distress=?, "
             "equity_signal=?, equity_confidence=?, equity_reasoning=?, "
+            "tax_deed_stage=?, days_until_tax_sale=?, "
             "value_confidence=?, computed_at=? WHERE property_id=?",
             (lien_count, int(has_tax), signal, eq_conf, eq_reason,
+             tax_stage, days_until_tax_sale,
              "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN", ts, property_id),
         )
         conn.execute(
@@ -1028,7 +1124,7 @@ def export_csv(conn, path):
         "o.display_name, o.mailing_address, o.mailing_city, o.mailing_state, o.mailing_zip, "
         "o.identity_confidence, "
         "v.pao_assessed_value, v.pao_market_value, v.equity_signal, v.equity_confidence, "
-        "v.active_lien_count, v.mortgage_estimate, "
+        "v.active_lien_count, v.mortgage_estimate, v.tax_deed_stage, v.days_until_tax_sale, "
         "(SELECT dealability_score FROM scores s WHERE s.property_id = p.id "
         " ORDER BY computed_at DESC LIMIT 1) AS dealability_score "
         "FROM documents d "
@@ -1043,7 +1139,8 @@ def export_csv(conn, path):
             "Property RE#", "Property Address", "Property City", "Property State", "Property Zip",
             "Address Match Confidence", "Property Type", "Property Type Decision", "Year Built",
             "PAO Assessed Value", "PAO Market Value", "Equity Signal", "Equity Confidence",
-            "Active Lien Count", "Mortgage Estimate", "Dealability Score",
+            "Active Lien Count", "Mortgage Estimate", "Tax Deed Stage", "Days Until Tax Sale",
+            "Dealability Score",
             "Suppressed", "Category", "Document Type", "Filed Date",
             "Document Number", "Amount", "Legal Description", "Flags", "Legacy Score", "Source",
             "First Seen", "Last Seen"]
@@ -1065,6 +1162,8 @@ def export_csv(conn, path):
                 r["equity_signal"] or "", r["equity_confidence"] or "",
                 r["active_lien_count"] if r["active_lien_count"] is not None else "",
                 r["mortgage_estimate"] or "UNKNOWN",
+                r["tax_deed_stage"] or "TAX_STAGE_NONE",
+                r["days_until_tax_sale"] if r["days_until_tax_sale"] is not None else "",
                 r["dealability_score"] if r["dealability_score"] is not None else "",
                 "yes" if r["property_id"] in suppressed_props else "no",
                 r["cat"] or "", r["doc_type"] or "", r["filed_date"] or "", r["doc_num"] or "",

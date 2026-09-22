@@ -1,0 +1,15 @@
+{
+  "_comment": "Phase 4 tax-deed timeline thresholds/points. Built entirely from the scheduled tax deed auction date already scraped from duval.realtaxdeed.com (documents.filed_date for doc_type='TAX DEED') -- there is no scraped source yet for the earlier stages of Florida's real tax process (delinquency, certificate sale, the 2-year certificate-holder eligibility window), so those are never claimed. A property with no scheduled auction on file is TAX_STAGE_NONE -- 'not currently on the auction calendar', not 'current on taxes'.",
+
+  "imminent_days": 30,
+  "soon_days": 90,
+
+  "runway_points": {
+    "_comment": "Out of dealability_weights.json's max_points.closing_runway (20). Measures time actually available to close a deal, not motivation -- an imminent auction is a highly motivated seller but a real risk of running out of time to close before the county sells it, so imminent scores LOWER here, not higher.",
+    "far": 20,
+    "soon": 12,
+    "imminent": 4,
+    "past_unverified": 0,
+    "none": 15
+  }
+}

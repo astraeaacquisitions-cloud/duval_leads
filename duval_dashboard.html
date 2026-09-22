@@ -546,6 +546,8 @@ function computeCompoundGroups(records){
       mortgage_estimate: (distress.find(g=>g.mortgage_estimate)||{}).mortgage_estimate || "UNKNOWN",
       dealability_score: (distress.find(g=>g.dealability_score!=null)||{}).dealability_score ?? null,
       dealability_reason: (distress.find(g=>g.dealability_reason)||{}).dealability_reason || "",
+      tax_deed_stage: (distress.find(g=>g.tax_deed_stage && g.tax_deed_stage!=="TAX_STAGE_NONE")||{}).tax_deed_stage || "TAX_STAGE_NONE",
+      days_until_tax_sale: (distress.find(g=>g.days_until_tax_sale!=null)||{}).days_until_tax_sale ?? null,
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -780,7 +782,7 @@ function renderFilingsRows(){
     const suppressed = isSuppressed(r.property_id);
     return `<tr data-idx="${start+i}"${suppressed?' class="is-suppressed"':''}>
       <td><div class="seal ${sealClass(sc)}">${sc}</div></td>
-      <td><span class="tab ${catClass(r.cat)}">${r.cat_label||r.doc_type||"–"}</span>${suppressed?'<span class="badge-suppressed">Suppressed</span>':''}</td>
+      <td><span class="tab ${catClass(r.cat)}">${r.cat_label||r.doc_type||"–"}</span>${taxCountdownBadgeHtml(r)}${suppressed?'<span class="badge-suppressed">Suppressed</span>':''}</td>
       <td class="mono">${r.doc_num||"–"}</td>
       <td class="mono">${r.filed||"–"}</td>
       <td class="owner-cell">${r.owner||"–"}${r.grantee?`<div class="sub">${r.grantee}</div>`:""}</td>
@@ -816,7 +818,7 @@ function renderCompoundRows(){
     return `<tr data-idx="${start+i}"${suppressed?' class="is-suppressed"':''}>
       <td><div class="tier-badge tier-${g.tier}">${g.tier}</div>${suppressed?'<span class="badge-suppressed">Suppr.</span>':''}</td>
       <td class="addr-cell">${addr}</td>
-      <td><div class="cat-chip-row">${g.cats.map(c=>`<span class="tab ${catClass(c)}">${c.replace('_',' ')}</span>`).join("")}</div></td>
+      <td><div class="cat-chip-row">${g.cats.map(c=>`<span class="tab ${catClass(c)}">${c.replace('_',' ')}</span>`).join("")}${taxCountdownBadgeHtml(g)}</div></td>
       <td class="mono">${g.filing_count}</td>
       <td><div class="seal ${sealClass(g.max_score)}">${g.max_score}</div></td>
       <td class="owner-cell">${g.owner||"–"}</td>
@@ -895,6 +897,54 @@ function valuationDealabilityHtml(r){
   `;
 }
 
+const TAX_STAGE_META = {
+  TAX_STAGE_IMMINENT:      {color:"var(--crit)",   label:"Imminent"},
+  TAX_STAGE_SOON:          {color:"var(--warn)",   label:"Soon"},
+  TAX_STAGE_FAR:           {color:"var(--good)",   label:"Scheduled"},
+  TAX_STAGE_PAST_UNVERIFIED:{color:"var(--purple)", label:"Past -- unverified"},
+};
+
+// Compact inline countdown for the table row -- only rendered for stages
+// worth a glance without opening the modal (imminent/soon/past-unverified;
+// "far" and "no schedule" aren't worth the row noise).
+function taxCountdownBadgeHtml(r){
+  const stage = r.tax_deed_stage;
+  if(!stage || stage==="TAX_STAGE_NONE" || stage==="TAX_STAGE_FAR") return "";
+  const meta = TAX_STAGE_META[stage] || {color:"var(--muted)", label:stage};
+  const days = r.days_until_tax_sale;
+  const text = days==null ? meta.label
+    : days < 0 ? `${Math.abs(days)}d ago`
+    : days === 0 ? "today" : `${days}d`;
+  return `<span class="equity-signal" style="border-color:${meta.color};color:${meta.color};margin-left:6px" title="Tax deed auction -- ${meta.label}">⏰ ${text}</span>`;
+}
+
+// Phase 4: tax-deed timeline. Built entirely from the one verified date
+// this pipeline scrapes (the scheduled auction date from
+// duval.realtaxdeed.com) -- earlier stages of Florida's real tax process
+// (delinquency, certificate sale, the 2-year certificate-holder window)
+// aren't tracked, so TAX_STAGE_NONE means "no scheduled auction on file",
+// not "current on taxes"; this section is omitted entirely in that case
+// rather than implying a timeline that doesn't exist.
+function taxDeedTimelineHtml(r){
+  const stage = r.tax_deed_stage || "TAX_STAGE_NONE";
+  if(stage === "TAX_STAGE_NONE") return "";
+  const meta = TAX_STAGE_META[stage] || {color:"var(--muted)", label:stage};
+  const days = r.days_until_tax_sale;
+  const countdown = days==null ? "– unknown –"
+    : days < 0 ? `${Math.abs(days)} day${Math.abs(days)===1?"":"s"} ago`
+    : days === 0 ? "Today"
+    : `${days} day${days===1?"":"s"}`;
+  return `
+    <div class="msection"><h4>Tax Deed Timeline</h4>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="equity-signal" style="border-color:${meta.color};color:${meta.color}">${meta.label}</span>
+        <span style="font-size:12.5px">${days!=null && days>=0 ? `Auction in ${countdown}` : days!=null ? `Auction was ${countdown}` : "Auction date unknown"}</span>
+      </div>
+      ${stage==="TAX_STAGE_PAST_UNVERIFIED"?`<div class="value-warning" style="margin-top:8px">Scheduled auction date has passed -- outcome (sold, redeemed, postponed) is not tracked by this pipeline. Verify manually before treating this as a live deal.</div>`:""}
+    </div>
+  `;
+}
+
 function reviewBadgesHtml(flags){
   flags = flags || [];
   const badges = [];
@@ -932,6 +982,7 @@ function openModal(r){
       <div style="font-size:12.5px">${r.years_owned!=null?`Owned ${r.years_owned} year${r.years_owned===1?"":"s"}${r.last_sale_date?` (since ${r.last_sale_date})`:""}`:"– sale history not found –"}</div>
     </div>
     ${valuationDealabilityHtml(r)}
+    ${taxDeedTimelineHtml(r)}
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(r.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
     </div>
@@ -978,6 +1029,7 @@ function openCompoundModal(g){
       <div style="font-size:12.5px">${g.years_owned!=null?`Owned ${g.years_owned} year${g.years_owned===1?"":"s"}`:"– sale history not found –"}</div>
     </div>
     ${valuationDealabilityHtml(g)}
+    ${taxDeedTimelineHtml(g)}
     <div class="msection"><h4>All Filings At This Address</h4>
       <ul class="filing-list">${filingsHtml}</ul>
     </div>

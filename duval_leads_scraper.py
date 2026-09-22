@@ -1007,7 +1007,8 @@ def enrich_records_with_ids(conn, records, run_id=None):
     valuations = {r["property_id"]: r for r in conn.execute(
         "SELECT property_id, pao_assessed_value, pao_market_value, pao_taxable_value, "
         "value_confidence, equity_signal, equity_confidence, equity_reasoning, "
-        "active_lien_count, has_tax_distress, mortgage_estimate FROM valuations")}
+        "active_lien_count, has_tax_distress, mortgage_estimate, "
+        "tax_deed_stage, days_until_tax_sale FROM valuations")}
     scores = {}
     if run_id:
         scores = {r["property_id"]: r for r in conn.execute(
@@ -1032,6 +1033,8 @@ def enrich_records_with_ids(conn, records, run_id=None):
         r["equity_reasoning"] = val["equity_reasoning"] if val else ""
         r["active_lien_count"] = val["active_lien_count"] if val else None
         r["mortgage_estimate"] = val["mortgage_estimate"] if val else "UNKNOWN"
+        r["tax_deed_stage"] = val["tax_deed_stage"] if val and val["tax_deed_stage"] else "TAX_STAGE_NONE"
+        r["days_until_tax_sale"] = val["days_until_tax_sale"] if val else None
 
         sc = scores.get(prop_id)
         r["dealability_score"] = sc["dealability_score"] if sc else None
