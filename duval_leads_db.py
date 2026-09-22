@@ -239,8 +239,61 @@ CREATE TABLE IF NOT EXISTS scrape_runs (
     notes TEXT
 );
 
+-- Phase 3: value/equity. Every value here is explicitly labeled --
+-- pao_assessed_value and pao_market_value are the two distinct county
+-- tax-roll figures (never treated as interchangeable, never as a
+-- verified current market value); automated_estimated_value,
+-- estimated_asis_market_value, estimated_arv, and comparable_sales_used
+-- stay NULL until a paid AVM/comp engine exists (a later phase) --
+-- deliberately not backfilled with a PAO value under a different name.
+CREATE TABLE IF NOT EXISTS valuations (
+    property_id TEXT PRIMARY KEY,
+    pao_assessed_value REAL,
+    pao_market_value REAL,
+    pao_taxable_value REAL,
+    automated_estimated_value REAL,
+    estimated_asis_market_value REAL,
+    estimated_arv REAL,
+    value_confidence TEXT,
+    valuation_date TEXT,
+    valuation_source TEXT,
+    comparable_sales_used TEXT,
+    last_sale_date TEXT,
+    last_sale_price REAL,
+    years_owned INTEGER,
+    active_lien_count INTEGER,
+    has_tax_distress INTEGER,
+    mortgage_estimate TEXT DEFAULT 'UNKNOWN',
+    equity_signal TEXT,
+    equity_confidence TEXT,
+    equity_reasoning TEXT,
+    computed_at TEXT
+);
+
+-- One row per scoring run per property (append-only -- this IS the audit
+-- log; the dashboard/export layer reads the latest row per property_id).
+-- Only dealability_score is populated as of Phase 3; the other four
+-- scores and tier arrive in Phase 8's stacked-distress/contact-priority
+-- engine, which is why they're nullable rather than added later.
+CREATE TABLE IF NOT EXISTS scores (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id TEXT NOT NULL,
+    computed_at TEXT,
+    distress_score INTEGER,
+    urgency_score INTEGER,
+    dealability_score INTEGER,
+    dealability_reason TEXT,
+    confidence_score INTEGER,
+    contact_priority_score INTEGER,
+    tier TEXT,
+    tier_reason TEXT,
+    weights_version TEXT,
+    scrape_run_id TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_documents_property ON documents(property_id);
 CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents(owner_id);
+CREATE INDEX IF NOT EXISTS idx_scores_property ON scores(property_id, computed_at);
 CREATE INDEX IF NOT EXISTS idx_evidence_entity ON evidence(entity_type, entity_id, field_name);
 CREATE INDEX IF NOT EXISTS idx_ownerships_owner ON ownerships(owner_id);
 """
@@ -248,7 +301,7 @@ CREATE INDEX IF NOT EXISTS idx_ownerships_owner ON ownerships(owner_id);
 TABLES = [
     "properties", "owners", "ownerships", "documents", "evidence",
     "suppressions", "contacts", "overrides", "research_tasks",
-    "hubspot_export_flags", "scrape_runs",
+    "hubspot_export_flags", "scrape_runs", "valuations", "scores",
 ]
 
 
@@ -441,6 +494,41 @@ def _upsert_property(conn, ts, re_number, situs_address, situs_city, situs_state
     return prop_id, confidence
 
 
+def _upsert_valuation_raw(conn, ts, property_id, market_value, assessed_value, taxable_value,
+                           last_sale_date, last_sale_price, years_owned):
+    """Stores only the raw PAO figures as they're scraped -- COALESCE onto
+    whatever's already there so a record with a missing field doesn't blank
+    out a previously-known one. Equity signal / dealability are computed
+    separately, once per property per run, by compute_dealability() below
+    -- they depend on cross-referencing every document tied to the
+    property, not just the one this record came from."""
+    if not property_id:
+        return
+    row = conn.execute("SELECT property_id FROM valuations WHERE property_id=?", (property_id,)).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE valuations SET pao_market_value=COALESCE(?, pao_market_value), "
+            "pao_assessed_value=COALESCE(?, pao_assessed_value), "
+            "pao_taxable_value=COALESCE(?, pao_taxable_value), "
+            "last_sale_date=COALESCE(NULLIF(?,''), last_sale_date), "
+            "last_sale_price=COALESCE(?, last_sale_price), "
+            "years_owned=COALESCE(?, years_owned), "
+            "valuation_date=?, valuation_source='Duval County Property Appraiser' "
+            "WHERE property_id=?",
+            (market_value, assessed_value, taxable_value, last_sale_date or "",
+             last_sale_price, years_owned, ts, property_id),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO valuations (property_id, pao_market_value, pao_assessed_value, "
+            "pao_taxable_value, last_sale_date, last_sale_price, years_owned, "
+            "valuation_date, valuation_source, mortgage_estimate) "
+            "VALUES (?,?,?,?,?,?,?,?,?,'UNKNOWN')",
+            (property_id, market_value, assessed_value, taxable_value, last_sale_date,
+             last_sale_price, years_owned, ts, "Duval County Property Appraiser"),
+        )
+
+
 def _upsert_owner(conn, ts, display_name, mailing_address, mailing_city, mailing_state,
                    mailing_zip, is_entity, is_trust, property_id, doc_id):
     owner_id, confidence = owner_identity(display_name, mailing_address, mailing_city,
@@ -505,6 +593,12 @@ def persist_records(conn, records, run_id, source_note=""):
             r.get("property_use_code", ""), r.get("property_type_label", ""),
             r.get("property_type_decision", ""), r.get("year_built"), r.get("building_count"),
         )
+        if prop_id:
+            _upsert_valuation_raw(
+                conn, ts, prop_id, r.get("market_value"), r.get("assessed_value"),
+                r.get("taxable_value"), r.get("last_sale_date"), r.get("last_sale_price"),
+                r.get("years_owned"),
+            )
         owner_id, owner_conf = _upsert_owner(
             conn, ts, r.get("owner", ""), r.get("mail_address", ""), r.get("mail_city", ""),
             r.get("mail_state", ""), r.get("mail_zip", ""), is_entity, is_trust, prop_id, doc_id,
@@ -596,6 +690,241 @@ def _add_research_task_if_absent(conn, task_type, property_id=None, owner_id=Non
         "status, priority, created_at) VALUES (?,?,?,?,?,'open',?,?)",
         (property_id, owner_id, document_id, task_type, description, priority, now_iso()),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: equity signal + Dealability Score.
+#
+# "The system must determine whether there is a plausible transaction
+# before spending excessive time enriching the lead" -- so this runs from
+# data already on hand (no new network calls): PAO's assessed/market
+# value, ownership tenure, and the distress documents already scraped for
+# this property. A real mortgage-balance lookup is a separate, deliberate
+# per-property research task, not automatic enrichment for every lead --
+# see mortgage_estimate, always 'UNKNOWN' here.
+# ---------------------------------------------------------------------------
+
+DEALABILITY_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "dealability_weights.json"
+)
+
+
+def load_dealability_config(path=DEALABILITY_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+DEALABILITY_CONFIG = load_dealability_config()
+
+# Categories that represent an active, unresolved distress claim against
+# the property. "release" is the opposite (a prior lien being cleared) and
+# "construction" (Notice of Commencement) isn't a claim at all, so neither
+# counts toward the lien load.
+ACTIVE_LIEN_CATS = {"lien", "judgment", "foreclosure", "code_violation", "tax", "probate"}
+
+
+def compute_equity_signal(years_owned, last_sale_price, market_value, config=None):
+    """Returns (signal, confidence, reasoning, appreciated). Deliberately a
+    category + plain-language reason, not a fabricated dollar figure -- no
+    mortgage data exists to net against a value, so a dollar 'equity'
+    number here would just be the value estimate wearing a different name.
+    `appreciated` is exposed so callers scoring the bonus don't have to
+    re-derive the same (nominal-sale-price-guarded) comparison themselves."""
+    config = config if config is not None else DEALABILITY_CONFIG
+    eq = config.get("equity_signal", {})
+
+    if years_owned is None:
+        return "UNKNOWN", "UNKNOWN", "No sale history found -- ownership tenure unknown.", False
+
+    strong_ratio = eq.get("appreciation_ratio_strong", 1.3)
+    # A recorded sale price under this floor is essentially always nominal
+    # consideration -- a family transfer, a quit-claim, a $1/$10/$100 deed
+    # -- not a real arm's-length sale. Dividing market value by a nominal
+    # price produces a nonsense multiplier (seen live: "risen 3671x" off a
+    # $100 sale), so those prices don't feed the appreciation claim at all;
+    # years_owned alone still drives the tenure signal either way.
+    nominal_floor = eq.get("nominal_sale_price_floor", 1000)
+    real_sale_price = last_sale_price if (last_sale_price and last_sale_price >= nominal_floor) else None
+    appreciated = (
+        real_sale_price and market_value
+        and (market_value / real_sale_price) >= strong_ratio
+    )
+
+    if years_owned >= eq.get("years_owned_substantial", 10):
+        reason = f"Owned {years_owned} years -- long enough that meaningful principal paydown and/or appreciation is plausible, even with no mortgage data."
+        if appreciated:
+            reason += f" County value has also risen {market_value/real_sale_price:.1f}x since the last recorded (non-nominal) sale."
+        return "LIKELY_SUBSTANTIAL", "ESTIMATED", reason, bool(appreciated)
+
+    if years_owned >= eq.get("years_owned_moderate", 4):
+        reason = f"Owned {years_owned} years -- some paydown/appreciation is plausible, but not long enough to assume it confidently."
+        return "LIKELY_MODERATE", "ESTIMATED", reason, bool(appreciated)
+
+    reason = f"Purchased only {years_owned} year{'s' if years_owned != 1 else ''} ago -- a recent purchase is more likely to carry a large mortgage relative to value; treat equity as unproven, not absent."
+    return "LIKELY_LIMITED", "INFERRED", reason, bool(appreciated)
+
+
+def compute_dealability_score(conn, property_id, config=None):
+    """Computes the Dealability Score (0-100) for one property from
+    what's already in the database -- no network calls. Returns
+    (score, reason, equity_signal, equity_confidence, equity_reasoning,
+    active_lien_count, has_tax_distress)."""
+    config = config if config is not None else DEALABILITY_CONFIG
+    mp = config.get("max_points", {})
+    reasons = []
+
+    prop = conn.execute(
+        "SELECT property_type_decision FROM properties WHERE id=?", (property_id,)
+    ).fetchone()
+    val = conn.execute(
+        "SELECT years_owned, last_sale_price, pao_market_value, pao_assessed_value "
+        "FROM valuations WHERE property_id=?", (property_id,)
+    ).fetchone()
+
+    years_owned = val["years_owned"] if val else None
+    last_sale_price = val["last_sale_price"] if val else None
+    market_value = val["pao_market_value"] if val else None
+
+    # -- Equity signal --
+    signal, eq_conf, eq_reason, appreciated = compute_equity_signal(years_owned, last_sale_price, market_value, config)
+    eq_cfg = config.get("equity_signal", {})
+    equity_points = {
+        "LIKELY_SUBSTANTIAL": eq_cfg.get("years_owned_substantial_points", 30),
+        "LIKELY_MODERATE": eq_cfg.get("years_owned_moderate_points", 18),
+        "LIKELY_LIMITED": eq_cfg.get("years_owned_recent_points", 8),
+        "UNKNOWN": eq_cfg.get("unknown_tenure_points", 10),
+    }.get(signal, 0)
+    if signal == "LIKELY_SUBSTANTIAL" and appreciated:
+        equity_points = min(equity_points + eq_cfg.get("appreciation_bonus_points", 5), mp.get("equity_signal", 35))
+    equity_points = min(equity_points, mp.get("equity_signal", 35))
+    reasons.append(f"Equity: {signal.replace('_',' ').title()} ({equity_points}/{mp.get('equity_signal',35)}) -- {eq_reason}")
+
+    # -- Manageable liens: total count of active distress documents
+    # recorded against this property, from what we've already scraped --
+    # real, verified counts, not dollar amounts (which aren't captured).
+    # This is property-level (a property can have multiple documents/leads
+    # feeding it -- that's what Compound Distress tracks), so it includes
+    # whichever document brought this property in: every lead has at least
+    # 1 by definition, which is why the "clear" threshold below is 1, not
+    # 0 -- it means "nothing beyond the single signal that flagged it."
+    lien_row = conn.execute(
+        "SELECT COUNT(*) c FROM documents WHERE property_id=? AND cat IN "
+        f"({','.join('?' for _ in ACTIVE_LIEN_CATS)})",
+        (property_id, *ACTIVE_LIEN_CATS),
+    ).fetchone()
+    active_lien_count = lien_row["c"] if lien_row else 0
+    tax_row = conn.execute(
+        "SELECT COUNT(*) c FROM documents WHERE property_id=? AND cat='tax'", (property_id,)
+    ).fetchone()
+    has_tax_distress = bool(tax_row and tax_row["c"])
+
+    lt = config.get("lien_thresholds", {})
+    if active_lien_count <= lt.get("clear_max", 0):
+        lien_points = lt.get("clear_points", 10)
+        lien_desc = "no other active distress recorded against this property"
+    elif active_lien_count <= lt.get("manageable_max", 2):
+        lien_points = lt.get("manageable_points", 5)
+        lien_desc = f"{active_lien_count} active distress records on this property"
+    else:
+        lien_points = lt.get("heavy_points", 0)
+        lien_desc = f"{active_lien_count} active distress records -- heavily encumbered"
+    reasons.append(f"Liens: {lien_points}/{mp.get('manageable_liens',10)} -- {lien_desc} (mortgage balance unknown -- see research queue).")
+
+    # -- Ownership clarity: from Phase 1's identity confidence + trust/entity flags --
+    owners = conn.execute(
+        "SELECT o.is_entity, o.is_trust, o.identity_confidence FROM ownerships ow "
+        "JOIN owners o ON o.id = ow.owner_id WHERE ow.property_id=?", (property_id,)
+    ).fetchall()
+    oc = config.get("ownership_clarity", {})
+    if not owners:
+        owner_points = oc.get("unconfirmed_identity_points", 4)
+        owner_desc = "no confirmed owner on file"
+    else:
+        any_trust = any(o["is_trust"] for o in owners)
+        any_entity = any(o["is_entity"] for o in owners)
+        best_conf = any(o["identity_confidence"] in ("verified_parcel", "name_and_mailing_address") for o in owners)
+        if any_trust:
+            owner_points = oc.get("trust_review_required_points", 6)
+            owner_desc = "trust ownership -- trustee authority not yet verified"
+        elif any_entity:
+            owner_points = oc.get("entity_owned_points", 8)
+            owner_desc = "entity-held title"
+        elif best_conf:
+            owner_points = oc.get("verified_individual_points", 15)
+            owner_desc = "individual owner, identity confirmed"
+        else:
+            owner_points = oc.get("unconfirmed_identity_points", 4)
+            owner_desc = "owner identity not yet confirmed"
+        if len(owners) > 1:
+            owner_points = max(0, owner_points - oc.get("multiple_owners_penalty", 3))
+            owner_desc += f"; {len(owners)} owners on file, all must be accounted for"
+    reasons.append(f"Ownership clarity: {owner_points}/{mp.get('ownership_clarity',15)} -- {owner_desc}.")
+
+    # -- Fits acquisition criteria: Phase 2's classification --
+    decision = prop["property_type_decision"] if prop else None
+    fits_points = mp.get("fits_acquisition_criteria", 10) if decision == "include" else \
+        (mp.get("fits_acquisition_criteria", 10) // 2 if decision == "review" else 0)
+    reasons.append(f"Acquisition criteria fit: {fits_points}/{mp.get('fits_acquisition_criteria',10)} -- property type is '{decision or 'unknown'}'.")
+
+    # -- Reliable value estimate: did PAO enrichment succeed at all --
+    vr = config.get("value_reliability", {})
+    value_points = vr.get("matched_points", 10) if market_value else vr.get("unmatched_points", 0)
+    reasons.append(f"Value reliability: {value_points}/{mp.get('reliable_value_estimate',10)} -- "
+                    f"{'PAO market/assessed value on file' if market_value else 'no PAO value found for this property'}.")
+
+    # -- Closing runway: placeholder pending Phase 4/5 timeline engines --
+    runway_points = config.get("closing_runway", {}).get("default_points", 15)
+    reasons.append(f"Closing runway: {runway_points}/{mp.get('closing_runway',20)} -- no verified deadline data yet "
+                    f"(Phase 4/5 will replace this placeholder with real tax-deed/foreclosure countdowns).")
+
+    # A hard cap for confirmed negative equity is intentionally not wired
+    # in yet: no data source here actually confirms negative equity (that
+    # needs a real mortgage payoff, Tier 2, not yet built) -- applying
+    # config's negative_equity_cap against an unconfirmed signal would be
+    # penalizing a guess as if it were a fact. Revisit once Tier 2 lands.
+    total = max(0, min(100, equity_points + lien_points + owner_points + fits_points + value_points + runway_points))
+    reason = " | ".join(reasons)
+    return total, reason, signal, eq_conf, eq_reason, active_lien_count, has_tax_distress
+
+
+def compute_dealability_for_all_properties(conn, run_id, config=None):
+    """Runs after persist_records() for the run. Re-scores every property
+    on file, not just ones touched this run -- cheap (pure SQL, no
+    network) and keeps every score consistent with the latest data.
+    Appends one scores row per property (the audit log) and refreshes
+    that property's valuations row. Properties that clear a minimum
+    dealability bar get a Tier 2 'estimate_mortgage_payoff' research task
+    queued -- the real payoff lookup stays a deliberate per-property
+    action, never automatic enrichment for every lead."""
+    config = config if config is not None else DEALABILITY_CONFIG
+    ts = now_iso()
+    tier2_threshold = config.get("tier2_mortgage_lookup_threshold", 50)
+    property_ids = [r["id"] for r in conn.execute("SELECT id FROM properties")]
+    for property_id in property_ids:
+        score, reason, signal, eq_conf, eq_reason, lien_count, has_tax = compute_dealability_score(
+            conn, property_id, config
+        )
+        conn.execute(
+            "UPDATE valuations SET active_lien_count=?, has_tax_distress=?, "
+            "equity_signal=?, equity_confidence=?, equity_reasoning=?, "
+            "value_confidence=?, computed_at=? WHERE property_id=?",
+            (lien_count, int(has_tax), signal, eq_conf, eq_reason,
+             "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN", ts, property_id),
+        )
+        conn.execute(
+            "INSERT INTO scores (property_id, computed_at, dealability_score, dealability_reason, "
+            "weights_version, scrape_run_id) VALUES (?,?,?,?,?,?)",
+            (property_id, ts, score, reason, "phase3-v1", run_id),
+        )
+        if score >= tier2_threshold:
+            _add_research_task_if_absent(
+                conn, "estimate_mortgage_payoff", property_id=property_id,
+                description=f"Dealability Score {score}/100 -- worth a real mortgage-payoff lookup "
+                             f"(Official Records name/parcel history search) before assuming the equity signal.",
+                priority="normal",
+            )
+    conn.commit()
+    return len(property_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -697,10 +1026,15 @@ def export_csv(conn, path):
         "p.address_match_confidence, p.first_seen_at AS property_first_seen, "
         "p.property_type_label, p.property_type_decision, p.year_built, "
         "o.display_name, o.mailing_address, o.mailing_city, o.mailing_state, o.mailing_zip, "
-        "o.identity_confidence "
+        "o.identity_confidence, "
+        "v.pao_assessed_value, v.pao_market_value, v.equity_signal, v.equity_confidence, "
+        "v.active_lien_count, v.mortgage_estimate, "
+        "(SELECT dealability_score FROM scores s WHERE s.property_id = p.id "
+        " ORDER BY computed_at DESC LIMIT 1) AS dealability_score "
         "FROM documents d "
         "LEFT JOIN properties p ON p.id = d.property_id "
         "LEFT JOIN owners o ON o.id = d.owner_id "
+        "LEFT JOIN valuations v ON v.property_id = d.property_id "
         "ORDER BY d.filed_date DESC"
     ).fetchall()
 
@@ -708,6 +1042,8 @@ def export_csv(conn, path):
             "Mailing Address", "Mailing City", "Mailing State", "Mailing Zip", "Owner Identity Confidence",
             "Property RE#", "Property Address", "Property City", "Property State", "Property Zip",
             "Address Match Confidence", "Property Type", "Property Type Decision", "Year Built",
+            "PAO Assessed Value", "PAO Market Value", "Equity Signal", "Equity Confidence",
+            "Active Lien Count", "Mortgage Estimate", "Dealability Score",
             "Suppressed", "Category", "Document Type", "Filed Date",
             "Document Number", "Amount", "Legal Description", "Flags", "Legacy Score", "Source",
             "First Seen", "Last Seen"]
@@ -725,6 +1061,11 @@ def export_csv(conn, path):
                 r["re_number"] or "", r["situs_address"] or "", r["situs_city"] or "",
                 r["situs_state"] or "", r["situs_zip"] or "", r["address_match_confidence"] or "",
                 r["property_type_label"] or "", r["property_type_decision"] or "", r["year_built"] or "",
+                r["pao_assessed_value"] or "", r["pao_market_value"] or "",
+                r["equity_signal"] or "", r["equity_confidence"] or "",
+                r["active_lien_count"] if r["active_lien_count"] is not None else "",
+                r["mortgage_estimate"] or "UNKNOWN",
+                r["dealability_score"] if r["dealability_score"] is not None else "",
                 "yes" if r["property_id"] in suppressed_props else "no",
                 r["cat"] or "", r["doc_type"] or "", r["filed_date"] or "", r["doc_num"] or "",
                 r["amount"] or "", r["legal_desc"] or "",

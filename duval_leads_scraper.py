@@ -552,16 +552,30 @@ def get_detail(session, re_raw):
         mailing_address = ""
         mailing_csz = ""
 
-    market_value_str = (
-        text("ctl00_cphBody_lblJustMarketValueInProgress")
-        or text("ctl00_cphBody_lblJustMarketValueCertified")
-    )
-    market_value = None
-    if market_value_str:
+    def parse_money(s):
+        if not s:
+            return None
         try:
-            market_value = float(market_value_str.replace("$", "").replace(",", ""))
+            return float(s.replace("$", "").replace(",", ""))
         except ValueError:
-            pass
+            return None
+
+    def money_field(in_progress_id, certified_id):
+        # Prefer the current working-roll value; some fields (e.g. Taxable
+        # Value's InProgress cell) read "See below" instead of a number
+        # for part of the year, so fall back to the last certified figure
+        # rather than silently returning nothing.
+        return parse_money(text(in_progress_id)) if parse_money(text(in_progress_id)) is not None \
+            else parse_money(text(certified_id))
+
+    # Just (Market) Value and Assessed Value are genuinely different in FL
+    # once Save-Our-Homes/non-homestead caps apply -- never treat one as a
+    # stand-in for the other. See PROPERTY_TYPE_CONFIG-style caveat: PAO
+    # values are a county tax-roll figure, not a verified current market
+    # value (surfaced to the dashboard, not silently assumed here).
+    market_value = money_field("ctl00_cphBody_lblJustMarketValueInProgress", "ctl00_cphBody_lblJustMarketValueCertified")
+    assessed_value = money_field("ctl00_cphBody_lblAssessedValueA10InProgress", "ctl00_cphBody_lblAssessedValueA10Certified")
+    taxable_value = money_field("ctl00_cphBody_lblTaxableValueInProgress", "ctl00_cphBody_lblTaxableValueCertified")
 
     last_sale_date = None
     last_sale_price = None
@@ -617,6 +631,8 @@ def get_detail(session, re_raw):
         "mailing_address": mailing_address,
         "mailing_city_state_zip": mailing_csz,
         "market_value": market_value,
+        "assessed_value": assessed_value,
+        "taxable_value": taxable_value,
         "last_sale_date": last_sale_date,
         "last_sale_price": last_sale_price,
         "property_use_code": property_use_code,
@@ -857,7 +873,10 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
             "score": score,
             "source": "Duval County Clerk -- Official Records",
             "market_value": match.get("market_value"),
+            "assessed_value": match.get("assessed_value"),
+            "taxable_value": match.get("taxable_value"),
             "last_sale_date": last_sale_date,
+            "last_sale_price": match.get("last_sale_price"),
             "years_owned": years_owned,
         }
         take(doc_num, record)
@@ -945,7 +964,10 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
                 "score": score,
                 "source": "Duval County Tax Deed Auction",
                 "market_value": detail.get("market_value"),
+                "assessed_value": detail.get("assessed_value"),
+                "taxable_value": detail.get("taxable_value"),
                 "last_sale_date": last_sale_date,
+                "last_sale_price": detail.get("last_sale_price"),
                 "years_owned": years_owned,
             }
             take(doc_num, record)
@@ -966,14 +988,15 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
     return records
 
 
-def enrich_records_with_ids(conn, records):
+def enrich_records_with_ids(conn, records, run_id=None):
     """Looks up the property_id/owner_id that persist_records() just
     assigned (deterministically, from the DB module -- the single source
-    of truth for identity), plus the confidence labels for each, and
-    merges them back into the in-memory record dicts as additive fields.
-    This does not touch, reorder, or filter `records` -- it only adds
-    keys -- so it has no effect on the accumulate-by-doc_num history
-    mechanism records.json depends on."""
+    of truth for identity), plus the confidence labels and Phase 3
+    valuation/dealability results, and merges them back into the
+    in-memory record dicts as additive fields. This does not touch,
+    reorder, or filter `records` -- it only adds keys -- so it has no
+    effect on the accumulate-by-doc_num history mechanism records.json
+    depends on."""
     doc_rows = conn.execute(
         "SELECT source_name, doc_num, doc_type, property_id, owner_id FROM documents"
     ).fetchall()
@@ -981,6 +1004,15 @@ def enrich_records_with_ids(conn, records):
         "SELECT id, address_match_confidence FROM properties")}
     owner_conf = {r["id"]: r["identity_confidence"] for r in conn.execute(
         "SELECT id, identity_confidence FROM owners")}
+    valuations = {r["property_id"]: r for r in conn.execute(
+        "SELECT property_id, pao_assessed_value, pao_market_value, pao_taxable_value, "
+        "value_confidence, equity_signal, equity_confidence, equity_reasoning, "
+        "active_lien_count, has_tax_distress, mortgage_estimate FROM valuations")}
+    scores = {}
+    if run_id:
+        scores = {r["property_id"]: r for r in conn.execute(
+            "SELECT property_id, dealability_score, dealability_reason FROM scores WHERE scrape_run_id=?",
+            (run_id,))}
     by_key = {(r["source_name"], r["doc_num"], r["doc_type"]): (r["property_id"], r["owner_id"]) for r in doc_rows}
 
     for r in records:
@@ -989,6 +1021,21 @@ def enrich_records_with_ids(conn, records):
         r["owner_id"] = owner_id
         r["address_match_confidence"] = prop_conf.get(prop_id, "unmatched")
         r["owner_identity_confidence"] = owner_conf.get(owner_id, "unmatched")
+
+        val = valuations.get(prop_id)
+        r["pao_assessed_value"] = val["pao_assessed_value"] if val else None
+        r["pao_market_value"] = val["pao_market_value"] if val else None
+        r["pao_taxable_value"] = val["pao_taxable_value"] if val else None
+        r["value_confidence"] = val["value_confidence"] if val else "UNKNOWN"
+        r["equity_signal"] = val["equity_signal"] if val else "UNKNOWN"
+        r["equity_confidence"] = val["equity_confidence"] if val else "UNKNOWN"
+        r["equity_reasoning"] = val["equity_reasoning"] if val else ""
+        r["active_lien_count"] = val["active_lien_count"] if val else None
+        r["mortgage_estimate"] = val["mortgage_estimate"] if val else "UNKNOWN"
+
+        sc = scores.get(prop_id)
+        r["dealability_score"] = sc["dealability_score"] if sc else None
+        r["dealability_reason"] = sc["dealability_reason"] if sc else ""
     return records
 
 
@@ -1055,7 +1102,10 @@ def main():
         db.finish_run(conn, run_id, n_persisted, status="ok")
         print(f"[db] Persisted {n_persisted} records this run (full accumulated history, not just today's pull)")
 
-        records = enrich_records_with_ids(conn, records)
+        n_scored = db.compute_dealability_for_all_properties(conn, run_id)
+        print(f"[db] Computed Dealability Score for {n_scored} properties")
+
+        records = enrich_records_with_ids(conn, records, run_id=run_id)
 
     today = datetime.date.today()
     fetch_start = today - datetime.timedelta(days=args.days - 1)

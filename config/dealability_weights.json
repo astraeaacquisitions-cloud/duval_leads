@@ -1,0 +1,59 @@
+{
+  "_comment": "Phase 3 Dealability Score weights/thresholds. Edit this file to retune scoring -- no code changes needed. Matches the original scoring framework: equity up to 35, closing runway up to 20, ownership clarity up to 15, manageable liens up to 10, fits acquisition criteria up to 10, reliable value estimate up to 10.",
+
+  "max_points": {
+    "equity_signal": 35,
+    "closing_runway": 20,
+    "ownership_clarity": 15,
+    "manageable_liens": 10,
+    "fits_acquisition_criteria": 10,
+    "reliable_value_estimate": 10
+  },
+
+  "equity_signal": {
+    "_comment": "No mortgage-balance data exists yet (Tier 2, deferred -- see README). These are ESTIMATED/INFERRED proxies from ownership tenure and appreciation, not a real equity calculation.",
+    "years_owned_substantial": 10,
+    "years_owned_substantial_points": 30,
+    "years_owned_moderate": 4,
+    "years_owned_moderate_points": 18,
+    "years_owned_recent_points": 8,
+    "unknown_tenure_points": 10,
+    "appreciation_ratio_strong": 1.3,
+    "appreciation_bonus_points": 5,
+    "nominal_sale_price_floor": 1000
+  },
+
+  "lien_thresholds": {
+    "_comment": "Total count of active (non-released) distress documents recorded against this property. Every lead has at least 1 by definition (the signal that flagged it), so clear_max=1 means 'nothing beyond that single signal.'",
+    "clear_max": 1,
+    "clear_points": 10,
+    "manageable_max": 3,
+    "manageable_points": 5,
+    "heavy_points": 0
+  },
+
+  "ownership_clarity": {
+    "verified_individual_points": 15,
+    "trust_review_required_points": 6,
+    "entity_owned_points": 8,
+    "unconfirmed_identity_points": 4,
+    "multiple_owners_penalty": 3
+  },
+
+  "closing_runway": {
+    "_comment": "No real timeline engine exists yet (Phase 4/5 build tax-deed/foreclosure countdowns). This is a neutral placeholder, not a claim about actual runway -- it will be replaced once real deadline data exists.",
+    "default_points": 15
+  },
+
+  "value_reliability": {
+    "matched_points": 10,
+    "unmatched_points": 0
+  },
+
+  "negative_equity_cap": {
+    "_comment": "Not yet wired -- no data source confirms negative equity without a real mortgage payoff (Tier 2). Documented for when that lands, not applied today.",
+    "max_total_score": 35
+  },
+
+  "tier2_mortgage_lookup_threshold": 50
+}

@@ -26,6 +26,8 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
   changes needed. This is the "manually enable" mechanism for apartments/
   commercial. `--include-all-property-types` on the scraper is a blunter,
   temporary override that disables the filter entirely.
+- `config/dealability_weights.json` -- Phase 3 Dealability Score weights
+  and thresholds. Edit to retune scoring -- no code changes needed.
 
 ## Property-type classification (Phase 2)
 
@@ -49,6 +51,42 @@ driven by `config/property_type_rules.json`) sorts every property into:
 residential land, or a single structure built before 1960) -- a signal to
 look at, not a score change and not a claim about actual condition or
 redevelopment feasibility.
+
+## Valuation and Dealability Score (Phase 3)
+
+Every property now carries a `valuations` row (PAO assessed value, PAO
+Just/Market value -- always shown and stored separately, never blended)
+and a `scores` row with a Dealability Score (0-100). Two rules drive the
+whole design:
+
+1. **No fabricated equity dollar figure.** There is no free source for a
+   mortgage balance, so "equity" is a labeled *signal*
+   (`LIKELY_SUBSTANTIAL` / `LIKELY_MODERATE` / `LIKELY_LIMITED` /
+   `UNKNOWN`) with a confidence (`ESTIMATED`/`INFERRED`/`UNKNOWN`) and a
+   plain-language reason, derived from ownership tenure and appreciation
+   -- never a dollar range that would just be the assessed value wearing
+   a different name. `automated_estimated_value`, `estimated_asis_market_value`,
+   `estimated_arv`, and `comparable_sales_used` stay `NULL` until a paid
+   AVM/comp engine exists (a later phase) -- not backfilled from PAO data
+   under a different name.
+2. **Two-tier mortgage research.** A real payoff lookup (an Official
+   Records name/parcel history search across *all* recorded mortgages,
+   not just distress filings) is expensive per-property research, so it's
+   never automatic. `mortgage_estimate` is always `'UNKNOWN'` until that
+   lookup happens by hand. Properties that clear
+   `tier2_mortgage_lookup_threshold` (default Dealability ≥ 50) get an
+   `estimate_mortgage_payoff` research task queued instead -- "determine
+   whether there's a plausible transaction before spending excessive time
+   enriching the lead," per the original brief.
+
+The dashboard always shows the required warning -- "County assessment is
+a tax-related valuation and has not been verified as current market
+value" -- next to the value fields, and the manageable-liens component of
+Dealability counts real, already-scraped active distress documents on the
+property (verified counts, not dollar amounts, which aren't captured).
+"Closing runway" (20 of the 100 points) is a neutral placeholder until
+Phase 4/5 build real tax-deed/foreclosure countdowns -- documented in the
+score's own reasoning text, not hidden.
 
 ## Data ownership
 

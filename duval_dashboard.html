@@ -302,6 +302,21 @@ tbody tr.is-suppressed{opacity:.45}
   display:inline-flex;align-items:center;font-family:var(--mono);font-size:9px;
   padding:1px 5px;border-radius:2px;border:1px solid var(--warn);color:var(--warn);
 }
+.value-warning{
+  font-size:11px;color:var(--muted);font-style:italic;padding:7px 10px;
+  background:var(--bg3);border-left:3px solid var(--warn);border-radius:2px;margin-bottom:10px;
+}
+.dealability-badge{
+  display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);
+  font-weight:600;font-size:14px;width:44px;height:44px;border-radius:50%;border:2px solid;
+  flex-shrink:0;
+}
+.equity-signal{
+  display:inline-flex;align-items:center;font-family:var(--mono);font-size:10px;
+  padding:2px 7px;border-radius:2px;border:1px solid var(--border2);color:var(--text);
+  text-transform:uppercase;letter-spacing:.03em;
+}
+.dealability-reason{font-size:11px;color:var(--muted2);line-height:1.6;margin-top:8px}
 .lead-mgmt{border-top:1px solid var(--border);padding-top:13px;margin-top:13px}
 .lead-mgmt h4{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;
   color:var(--muted);margin-bottom:10px}
@@ -522,6 +537,15 @@ function computeCompoundGroups(records){
       years_owned: yearsOwned >= 0 ? yearsOwned : null,
       market_value: (distress.find(g=>g.market_value)||{}).market_value ?? null,
       property_type_label: (distress.find(g=>g.property_type_label)||{}).property_type_label || "",
+      pao_assessed_value: (distress.find(g=>g.pao_assessed_value)||{}).pao_assessed_value ?? null,
+      pao_market_value: (distress.find(g=>g.pao_market_value)||{}).pao_market_value ?? null,
+      equity_signal: (distress.find(g=>g.equity_signal)||{}).equity_signal || "UNKNOWN",
+      equity_confidence: (distress.find(g=>g.equity_confidence)||{}).equity_confidence || "UNKNOWN",
+      equity_reasoning: (distress.find(g=>g.equity_reasoning)||{}).equity_reasoning || "",
+      active_lien_count: (distress.find(g=>g.active_lien_count!=null)||{}).active_lien_count ?? null,
+      mortgage_estimate: (distress.find(g=>g.mortgage_estimate)||{}).mortgage_estimate || "UNKNOWN",
+      dealability_score: (distress.find(g=>g.dealability_score!=null)||{}).dealability_score ?? null,
+      dealability_reason: (distress.find(g=>g.dealability_reason)||{}).dealability_reason || "",
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -833,6 +857,44 @@ function confidenceLabel(c){
     name_only_unmerged:"Unconfirmed identity", unmatched:"Unmatched"}[c] || c || "Unknown";
 }
 
+function dealabilityColor(s){
+  if(s==null) return "var(--muted)";
+  if(s>=60) return "var(--good)";
+  if(s>=35) return "var(--warn)";
+  return "var(--crit)";
+}
+
+// Phase 3: valuation + Dealability Score. Assessed and Just/Market Value
+// are always shown separately and labeled -- never blended into one
+// number -- and equity is always a labeled signal/confidence pair, never
+// a bare dollar figure (no mortgage-balance data exists to net against a
+// value; see mortgage_estimate, always UNKNOWN pending a real per-property
+// payoff lookup).
+function valuationDealabilityHtml(r){
+  const hasScore = r.dealability_score != null;
+  const color = dealabilityColor(r.dealability_score);
+  const reasonLines = (r.dealability_reason || "").split(" | ").filter(Boolean);
+  return `
+    <div class="msection"><h4>Valuation &amp; Dealability</h4>
+      <div class="value-warning">County assessment is a tax-related valuation and has not been verified as current market value.</div>
+      <div class="dgrid">
+        <div class="ditem"><label>PAO Assessed Value</label><div class="v mono">${r.pao_assessed_value?fmt$(r.pao_assessed_value):"– unknown –"}</div></div>
+        <div class="ditem"><label>PAO Just/Market Value</label><div class="v mono">${r.pao_market_value?fmt$(r.pao_market_value):"– unknown –"}</div></div>
+        <div class="ditem"><label>Estimated As-Is / ARV</label><div class="v" style="color:var(--muted)">Not available -- no AVM/comp engine yet</div></div>
+        <div class="ditem"><label>Mortgage Estimate</label><div class="v" style="color:var(--muted)">${r.mortgage_estimate||"UNKNOWN"}</div></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;margin-top:4px">
+        <div class="dealability-badge" style="border-color:${color};color:${color};background:color-mix(in srgb, ${color} 12%, transparent)" title="Dealability Score">${hasScore?r.dealability_score:"–"}</div>
+        <div style="flex:1">
+          <div><span class="equity-signal">${(r.equity_signal||"UNKNOWN").replace(/_/g," ")}</span> <span style="font-size:10.5px;color:var(--muted)">equity signal · ${r.equity_confidence||"UNKNOWN"}</span></div>
+          <div style="font-size:11px;color:var(--muted2);margin-top:3px">${r.equity_reasoning||"No equity signal available -- sale history not found."}</div>
+        </div>
+      </div>
+      ${reasonLines.length?`<div class="dealability-reason">${reasonLines.map(x=>`• ${x}`).join("<br/>")}</div>`:""}
+    </div>
+  `;
+}
+
 function reviewBadgesHtml(flags){
   flags = flags || [];
   const badges = [];
@@ -866,9 +928,10 @@ function openModal(r){
     <div class="msection"><h4>Mailing Address</h4>
       <div style="font-size:12.5px">${[r.mail_address,r.mail_city,r.mail_state,r.mail_zip].filter(Boolean).join(", ")||"– not found –"}</div>
     </div>
-    <div class="msection"><h4>Equity Proxy <span style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">(estimate, not a real equity %)</span></h4>
-      <div style="font-size:12.5px">${r.years_owned!=null?`Owned ${r.years_owned} year${r.years_owned===1?"":"s"}${r.last_sale_date?` (since ${r.last_sale_date})`:""}`:"– sale history not found –"}${r.market_value?` · County market value ${fmt$(r.market_value)}`:""}</div>
+    <div class="msection"><h4>Ownership Tenure</h4>
+      <div style="font-size:12.5px">${r.years_owned!=null?`Owned ${r.years_owned} year${r.years_owned===1?"":"s"}${r.last_sale_date?` (since ${r.last_sale_date})`:""}`:"– sale history not found –"}</div>
     </div>
+    ${valuationDealabilityHtml(r)}
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(r.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
     </div>
@@ -911,9 +974,10 @@ function openCompoundModal(g){
     <div class="msection"><h4>Mailing Address</h4>
       <div style="font-size:12.5px">${[g.mail_address,g.mail_city,g.mail_state].filter(Boolean).join(", ")||"– not found –"}</div>
     </div>
-    <div class="msection"><h4>Equity Proxy <span style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">(estimate, not a real equity %)</span></h4>
-      <div style="font-size:12.5px">${g.years_owned!=null?`Owned ${g.years_owned} year${g.years_owned===1?"":"s"}`:"– sale history not found –"}${g.market_value?` · County market value ${fmt$(g.market_value)}`:""}</div>
+    <div class="msection"><h4>Ownership Tenure</h4>
+      <div style="font-size:12.5px">${g.years_owned!=null?`Owned ${g.years_owned} year${g.years_owned===1?"":"s"}`:"– sale history not found –"}</div>
     </div>
+    ${valuationDealabilityHtml(g)}
     <div class="msection"><h4>All Filings At This Address</h4>
       <ul class="filing-list">${filingsHtml}</ul>
     </div>
