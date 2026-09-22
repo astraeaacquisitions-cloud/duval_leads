@@ -295,10 +295,13 @@ CREATE TABLE IF NOT EXISTS scores (
     property_id TEXT NOT NULL,
     computed_at TEXT,
     distress_score INTEGER,
+    distress_reason TEXT,
     urgency_score INTEGER,
+    urgency_reason TEXT,
     dealability_score INTEGER,
     dealability_reason TEXT,
     confidence_score INTEGER,
+    confidence_reason TEXT,
     contact_priority_score INTEGER,
     tier TEXT,
     tier_reason TEXT,
@@ -390,6 +393,9 @@ SCHEMA_MIGRATIONS = [
     ("valuations", "landlord_portfolio_stage", "TEXT"),
     ("valuations", "portfolio_property_count", "INTEGER"),
     ("valuations", "portfolio_distressed_count", "INTEGER"),
+    ("scores", "distress_reason", "TEXT"),
+    ("scores", "urgency_reason", "TEXT"),
+    ("scores", "confidence_reason", "TEXT"),
 ]
 
 
@@ -1325,6 +1331,231 @@ def compute_dealability_score(conn, property_id, config=None):
             tax_stage, days_until_tax_sale, foreclosure_stage, days_since_foreclosure_milestone)
 
 
+# ---------------------------------------------------------------------------
+# Phase 8: stacked-distress scoring, urgency, confidence, and contact
+# priority. This is where the signals built in Phases 2-7 -- property-type
+# fit, equity/dealability, tax-deed and foreclosure timelines, code
+# enforcement, absentee/landlord/probate -- finally get consumed into the
+# other four scores the `scores` table has carried as nullable columns
+# since Phase 3. No new data source; every input here was already
+# computed and persisted by an earlier phase.
+# ---------------------------------------------------------------------------
+
+STACKED_DISTRESS_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "stacked_distress_weights.json"
+)
+
+
+def load_stacked_distress_config(path=STACKED_DISTRESS_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+STACKED_DISTRESS_CONFIG = load_stacked_distress_config()
+
+
+def compute_distress_score(conn, property_id, config=None):
+    """Returns (score, reason). Rewards breadth (distinct active distress
+    categories on this property, the Compound Distress view's Tier 1/2/3
+    concept) and depth (advanced-stage signals from Phases 4-6) --
+    'stacked' distress, not just any single filing."""
+    config = config if config is not None else STACKED_DISTRESS_CONFIG
+    dc = config.get("distress", {})
+
+    rows = conn.execute(
+        "SELECT DISTINCT cat FROM documents WHERE property_id=? AND cat IN "
+        f"({','.join('?' for _ in ACTIVE_LIEN_CATS)})",
+        (property_id, *ACTIVE_LIEN_CATS),
+    ).fetchall()
+    distinct_cats = len(rows)
+    doc_count_row = conn.execute(
+        "SELECT COUNT(*) c FROM documents WHERE property_id=? AND cat IN "
+        f"({','.join('?' for _ in ACTIVE_LIEN_CATS)})",
+        (property_id, *ACTIVE_LIEN_CATS),
+    ).fetchone()
+    doc_count = doc_count_row["c"] if doc_count_row else 0
+
+    if distinct_cats == 0:
+        return 0, "No active distress documents on file for this property."
+
+    cat_pts = dc.get("distinct_categories_points", {})
+    breadth_points = cat_pts.get("3+", 40) if distinct_cats >= 3 else cat_pts.get(str(distinct_cats), 10)
+
+    doc_pts = dc.get("document_count_points", {})
+    if doc_count >= 4:
+        depth_points = doc_pts.get("4+", 30)
+    elif doc_count >= 2:
+        depth_points = doc_pts.get("2-3", 15)
+    else:
+        depth_points = doc_pts.get("1", 5)
+
+    val = conn.execute(
+        "SELECT tax_deed_stage, foreclosure_stage, code_enforcement_stage FROM valuations WHERE property_id=?",
+        (property_id,),
+    ).fetchone()
+    bonus_cfg = dc.get("advanced_stage_bonus", {})
+    bonus = 0
+    bonus_reasons = []
+    if val:
+        if val["tax_deed_stage"] in ("TAX_STAGE_IMMINENT", "TAX_STAGE_PAST_UNVERIFIED"):
+            bonus += bonus_cfg.get("tax_imminent_or_past", 15)
+            bonus_reasons.append("tax deed sale imminent or past")
+        if val["foreclosure_stage"] in ("FORECLOSURE_STAGE_JUDGMENT_ENTERED", "FORECLOSURE_STAGE_JUDGMENT_STALE"):
+            bonus += bonus_cfg.get("foreclosure_judgment", 15)
+            bonus_reasons.append("foreclosure judgment entered")
+        if val["code_enforcement_stage"] == "CODE_STAGE_REPEAT":
+            bonus += bonus_cfg.get("code_enforcement_repeat", 10)
+            bonus_reasons.append("repeat code violations")
+
+    total = max(0, min(100, breadth_points + depth_points + bonus))
+    reason = (
+        f"{distinct_cats} distinct distress categor{'y' if distinct_cats==1 else 'ies'} "
+        f"({breadth_points} pts), {doc_count} active document{'s' if doc_count!=1 else ''} ({depth_points} pts)"
+        + (f", advanced-stage bonus for {', '.join(bonus_reasons)} (+{bonus})" if bonus_reasons else "")
+        + "."
+    )
+    return total, reason
+
+
+def compute_urgency_score(conn, property_id, config=None):
+    """Returns (score, reason). The mirror image of Dealability's
+    closing-runway component: an imminent tax deed auction or a recently
+    entered foreclosure judgment means LOW time to close (bad for
+    dealability) but HIGH urgency (act now or the opportunity is gone).
+    Reuses the same tax/foreclosure timeline data Phases 4-5 already
+    computed rather than re-deriving it."""
+    config = config if config is not None else STACKED_DISTRESS_CONFIG
+    uc = config.get("urgency", {})
+
+    val = conn.execute(
+        "SELECT tax_deed_stage, foreclosure_stage, code_enforcement_stage FROM valuations WHERE property_id=?",
+        (property_id,),
+    ).fetchone()
+    if not val:
+        return 0, "No timeline or distress data on file for this property."
+
+    tax_pts = uc.get("tax_stage_points", {})
+    fc_pts = uc.get("foreclosure_stage_points", {})
+    base = 0
+    reason = "No tax-deed or foreclosure timeline data on file."
+    if val["tax_deed_stage"] in tax_pts:
+        base = tax_pts[val["tax_deed_stage"]]
+        reason = f"Tax deed stage {val['tax_deed_stage']} ({base} pts)."
+    elif val["foreclosure_stage"] in fc_pts:
+        base = fc_pts[val["foreclosure_stage"]]
+        reason = f"Foreclosure stage {val['foreclosure_stage']} ({base} pts)."
+    elif conn.execute(
+        "SELECT COUNT(*) c FROM documents WHERE property_id=? AND cat IN "
+        f"({','.join('?' for _ in ACTIVE_LIEN_CATS)})",
+        (property_id, *ACTIVE_LIEN_CATS),
+    ).fetchone()["c"]:
+        base = uc.get("no_timeline_baseline", 15)
+        reason = "No scraped timeline date, but active distress documents exist -- a modest baseline, not zero."
+
+    bonus = 0
+    if val["code_enforcement_stage"] == "CODE_STAGE_REPEAT":
+        bonus = uc.get("code_enforcement_repeat_bonus", 10)
+        reason += f" Repeat code violations add {bonus} (ongoing risk of escalation)."
+
+    total = max(0, min(100, base + bonus))
+    return total, reason
+
+
+def compute_confidence_score(conn, property_id, config=None):
+    """Returns (score, reason). Data-quality/contactability, NOT deal
+    quality -- a high Dealability Score on a lead we can't verify or
+    don't know who to contact isn't a real opportunity yet."""
+    config = config if config is not None else STACKED_DISTRESS_CONFIG
+    cc = config.get("confidence", {})
+
+    prop = conn.execute(
+        "SELECT address_match_confidence FROM properties WHERE id=?", (property_id,)
+    ).fetchone()
+    owners = conn.execute(
+        "SELECT o.identity_confidence FROM ownerships ow JOIN owners o ON o.id = ow.owner_id "
+        "WHERE ow.property_id=?", (property_id,)
+    ).fetchall()
+    val = conn.execute("SELECT pao_market_value FROM valuations WHERE property_id=?", (property_id,)).fetchone()
+    flags_rows = conn.execute(
+        "SELECT flags_json FROM documents WHERE property_id=?", (property_id,)
+    ).fetchall()
+    all_flags = set()
+    for fr in flags_rows:
+        try:
+            all_flags.update(json.loads(fr["flags_json"] or "[]"))
+        except (ValueError, TypeError):
+            pass
+
+    addr_pts = cc.get("address_match_points", {}).get(
+        prop["address_match_confidence"] if prop else "unmatched", 0
+    )
+    best_owner_conf = "unmatched"
+    owner_rank = {"name_and_mailing_address": 3, "name_and_property_only": 2, "name_only_unmerged": 1, "unmatched": 0}
+    for o in owners:
+        if owner_rank.get(o["identity_confidence"], 0) > owner_rank.get(best_owner_conf, 0):
+            best_owner_conf = o["identity_confidence"]
+    owner_pts = cc.get("owner_identity_points", {}).get(best_owner_conf, 0)
+    value_pts = cc.get("value_confidence_points", {}).get(
+        "matched" if (val and val["pao_market_value"]) else "unmatched", 0
+    )
+
+    review_flags = {"TRUST_OWNERSHIP_REVIEW_REQUIRED", "PROBATE_REPRESENTATIVE_REVIEW_REQUIRED", "PROPERTY_TYPE_REVIEW_REQUIRED"}
+    penalty_count = len(all_flags & review_flags)
+    penalty = penalty_count * cc.get("review_flag_penalty", 5)
+
+    base = cc.get("base_points", 10)
+    total = max(0, min(100, addr_pts + owner_pts + value_pts + base - penalty))
+    reason = (
+        f"Address match: {prop['address_match_confidence'] if prop else 'unmatched'} ({addr_pts} pts) | "
+        f"Owner identity: {best_owner_conf} ({owner_pts} pts) | "
+        f"PAO value: {'matched' if value_pts else 'unmatched'} ({value_pts} pts)"
+        + (f" | {penalty_count} review flag(s) present (-{penalty})" if penalty_count else "")
+        + "."
+    )
+    return total, reason
+
+
+def compute_contact_priority_and_tier(dealability_score, distress_score, urgency_score, confidence_score, config=None):
+    """Returns (contact_priority_score, tier, tier_reason). The master
+    ranking -- a weighted blend of all four scores, capped when
+    confidence is too low to act on regardless of how distressed, urgent,
+    or dealable the lead otherwise looks."""
+    config = config if config is not None else STACKED_DISTRESS_CONFIG
+    cp = config.get("contact_priority", {})
+    blend = (
+        dealability_score * cp.get("dealability_weight", 0.35)
+        + distress_score * cp.get("distress_weight", 0.20)
+        + urgency_score * cp.get("urgency_weight", 0.30)
+        + confidence_score * cp.get("confidence_weight", 0.15)
+    )
+    cap_cfg = cp.get("low_confidence_cap", {})
+    capped = False
+    if confidence_score < cap_cfg.get("threshold", 25) and blend > cap_cfg.get("cap", 50):
+        blend = cap_cfg.get("cap", 50)
+        capped = True
+
+    score = max(0, min(100, round(blend)))
+
+    tiers = config.get("tiers", {})
+    if score >= tiers.get("A", 80):
+        tier = "A"
+    elif score >= tiers.get("B", 65):
+        tier = "B"
+    elif score >= tiers.get("C", 50):
+        tier = "C"
+    elif score >= tiers.get("D", 30):
+        tier = "D"
+    else:
+        tier = "E"
+
+    reason = (
+        f"Tier {tier} ({score}/100) -- Dealability {dealability_score}, Distress {distress_score}, "
+        f"Urgency {urgency_score}, Confidence {confidence_score}"
+        + (". Capped: confidence too low to prioritize further until identity/address is verified." if capped else ".")
+    )
+    return score, tier, reason
+
+
 def compute_dealability_for_all_properties(conn, run_id, config=None):
     """Runs after persist_records() for the run. Re-scores every property
     on file, not just ones touched this run -- cheap (pure SQL, no
@@ -1346,6 +1577,12 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
         absentee_stage, _absentee_reason = compute_absentee_signal(conn, property_id)
         landlord_stage, portfolio_count, portfolio_distressed_count, _landlord_reason = \
             compute_landlord_portfolio_signal(conn, property_id)
+        distress_score, distress_reason = compute_distress_score(conn, property_id)
+        urgency_score, urgency_reason = compute_urgency_score(conn, property_id)
+        confidence_score, confidence_reason = compute_confidence_score(conn, property_id)
+        contact_priority_score, tier, tier_reason = compute_contact_priority_and_tier(
+            score, distress_score, urgency_score, confidence_score
+        )
         conn.execute(
             "UPDATE valuations SET active_lien_count=?, has_tax_distress=?, "
             "equity_signal=?, equity_confidence=?, equity_reasoning=?, "
@@ -1363,9 +1600,13 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
              "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN", ts, property_id),
         )
         conn.execute(
-            "INSERT INTO scores (property_id, computed_at, dealability_score, dealability_reason, "
-            "weights_version, scrape_run_id) VALUES (?,?,?,?,?,?)",
-            (property_id, ts, score, reason, "phase3-v1", run_id),
+            "INSERT INTO scores (property_id, computed_at, distress_score, distress_reason, "
+            "urgency_score, urgency_reason, dealability_score, dealability_reason, "
+            "confidence_score, confidence_reason, contact_priority_score, tier, tier_reason, "
+            "weights_version, scrape_run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (property_id, ts, distress_score, distress_reason, urgency_score, urgency_reason,
+             score, reason, confidence_score, confidence_reason, contact_priority_score, tier, tier_reason,
+             "phase8-v1", run_id),
         )
         if score >= tier2_threshold:
             _add_research_task_if_absent(
@@ -1483,12 +1724,17 @@ def export_csv(conn, path):
         "v.foreclosure_stage, v.days_since_foreclosure_milestone, "
         "v.code_enforcement_stage, v.code_violation_count, "
         "v.absentee_stage, v.landlord_portfolio_stage, v.portfolio_property_count, v.portfolio_distressed_count, "
-        "(SELECT dealability_score FROM scores s WHERE s.property_id = p.id "
-        " ORDER BY computed_at DESC LIMIT 1) AS dealability_score "
+        "sc.distress_score, sc.distress_reason, sc.urgency_score, sc.urgency_reason, "
+        "sc.dealability_score, sc.confidence_score, sc.confidence_reason, "
+        "sc.contact_priority_score, sc.tier, sc.tier_reason "
         "FROM documents d "
         "LEFT JOIN properties p ON p.id = d.property_id "
         "LEFT JOIN owners o ON o.id = d.owner_id "
         "LEFT JOIN valuations v ON v.property_id = d.property_id "
+        "LEFT JOIN (SELECT s1.* FROM scores s1 INNER JOIN "
+        " (SELECT property_id, MAX(computed_at) AS max_ts FROM scores GROUP BY property_id) latest "
+        " ON s1.property_id = latest.property_id AND s1.computed_at = latest.max_ts) sc "
+        " ON sc.property_id = p.id "
         "ORDER BY d.filed_date DESC"
     ).fetchall()
 
@@ -1501,7 +1747,8 @@ def export_csv(conn, path):
             "Foreclosure Stage", "Days Since Foreclosure Milestone",
             "Code Enforcement Stage", "Code Violation Count", "Code Violation Confidence (this document)",
             "Absentee Owner Stage", "Landlord Portfolio Stage", "Portfolio Property Count", "Portfolio Distressed Count",
-            "Dealability Score",
+            "Dealability Score", "Distress Score", "Distress Reason", "Urgency Score", "Urgency Reason",
+            "Confidence Score", "Confidence Reason", "Contact Priority Score", "Tier", "Tier Reason",
             "Suppressed", "Category", "Document Type", "Filed Date",
             "Document Number", "Amount", "Legal Description", "Flags", "Legacy Score", "Source",
             "First Seen", "Last Seen"]
@@ -1535,6 +1782,15 @@ def export_csv(conn, path):
                 r["portfolio_property_count"] if r["portfolio_property_count"] is not None else "",
                 r["portfolio_distressed_count"] if r["portfolio_distressed_count"] is not None else "",
                 r["dealability_score"] if r["dealability_score"] is not None else "",
+                r["distress_score"] if r["distress_score"] is not None else "",
+                r["distress_reason"] or "",
+                r["urgency_score"] if r["urgency_score"] is not None else "",
+                r["urgency_reason"] or "",
+                r["confidence_score"] if r["confidence_score"] is not None else "",
+                r["confidence_reason"] or "",
+                r["contact_priority_score"] if r["contact_priority_score"] is not None else "",
+                r["tier"] or "",
+                r["tier_reason"] or "",
                 "yes" if r["property_id"] in suppressed_props else "no",
                 r["cat"] or "", r["doc_type"] or "", r["filed_date"] or "", r["doc_num"] or "",
                 r["amount"] or "", r["legal_desc"] or "",

@@ -37,6 +37,9 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
   thresholds (the "recent vs. aged" single-violation cutoff).
 - `config/seller_profile.json` -- Phase 7 seller-profile thresholds (the
   multi-property portfolio cutoff).
+- `config/stacked_distress_weights.json` -- Phase 8 distress/urgency/
+  confidence weights, the contact-priority blend, the low-confidence
+  cap, and the A-E tier cutoffs.
 
 ## Property-type classification (Phase 2)
 
@@ -332,6 +335,72 @@ There is also no free, reliable source to verify whether a property is
 actually vacant. Rather than approximate either from data that doesn't
 support it (e.g. treating "absentee + old building" as a vacancy proxy),
 both are left out entirely and documented as a real gap.
+
+## Stacked-Distress Scoring, Urgency, Confidence & Contact Priority (Phase 8)
+
+This is where every signal built in Phases 2-7 finally gets consumed.
+The `scores` table has carried four nullable columns
+(`distress_score`, `urgency_score`, `confidence_score`,
+`contact_priority_score`, plus `tier`/`tier_reason`) since Phase 3's
+`dealability_score` was the only one populated -- Phase 8 fills in the
+rest, in `compute_distress_score()`, `compute_urgency_score()`,
+`compute_confidence_score()`, and `compute_contact_priority_and_tier()`
+(`duval_leads_db.py`), config-driven via
+`config/stacked_distress_weights.json`. No new data source -- every
+input was already computed and persisted by an earlier phase.
+
+**Four scores answer four different questions**, deliberately kept
+separate rather than folded into one number:
+
+- **Dealability** (Phase 3) -- *is this a workable deal?* Equity signal,
+  manageable liens, ownership clarity, acquisition fit, value
+  reliability, closing runway.
+- **Distress** -- *how much real legal/financial trouble is this
+  property in?* Rewards breadth (distinct active distress categories on
+  one property -- the Compound Distress view's Tier 1/2/3 concept,
+  recomputed server-side here) and depth (document count, plus an
+  advanced-stage bonus when the tax-deed, foreclosure, or code
+  enforcement timeline shows the distress has actually progressed, not
+  just that a lien was filed).
+- **Urgency** -- *how soon might something irreversible happen?* The
+  deliberate mirror image of Dealability's closing-runway component: an
+  imminent tax deed auction or a recently entered foreclosure judgment
+  means LOW time to close (bad for Dealability) but HIGH urgency (a
+  highly motivated seller, or a deal that disappears if not acted on
+  now). Reuses the exact same tax-deed/foreclosure timeline data Phases
+  4-5 already computed, with tax-deed taking precedence when a property
+  somehow has both (the more precise, exact-date signal).
+- **Confidence** -- *how well do we actually know this lead, and can we
+  identify who to contact?* Data quality, not deal quality. Address
+  match confidence, owner identity confidence, whether a PAO value
+  matched, minus a penalty per review-required flag on file
+  (`TRUST_OWNERSHIP_REVIEW_REQUIRED`, `PROBATE_REPRESENTATIVE_REVIEW_
+  REQUIRED`, `PROPERTY_TYPE_REVIEW_REQUIRED`) -- a high Dealability
+  Score on a lead we can't verify or don't know who to contact isn't a
+  real opportunity yet.
+
+**Contact Priority** blends all four (Dealability 35%, Urgency 30%,
+Distress 20%, Confidence 15%) into the master ranking, then applies a
+hard cap: when Confidence is below a threshold (default 25), priority
+is capped at 50 regardless of how good the rest looks -- a lead this
+uncertain can't be a top priority no matter how distressed, urgent, or
+dealable it appears, though it's still worth researching (capped, not
+zeroed). **Lead Tier** (A-E) buckets the final Contact Priority Score
+against config-driven cutoffs (A ≥ 80 down to E < 30), each with a
+plain-language `tier_reason` showing the four underlying scores.
+
+**Distinct from the Compound Distress view's own "Tier 1/2/3."** That
+number (how many distress *documents* stack on one property, computed
+client-side in the dashboard) predates Phase 8 and still drives the
+Compound Distress table's own Tier column; the new A-E letter is the
+Contact Priority tier and gets its own "Priority" column and filter
+(`tier-filter`) so the two are never confused on screen.
+
+The dashboard shows a new "Stacked Distress & Priority" modal section
+(all four scores plus the tier badge and every reasoning string) in
+both the single-filing and Compound Distress modals, and a compact
+"Priority" column (the A-E badge) sortable by `contact_priority_score`
+in both table views.
 
 ## Data ownership
 

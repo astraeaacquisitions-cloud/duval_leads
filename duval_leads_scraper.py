@@ -1039,7 +1039,10 @@ def enrich_records_with_ids(conn, records, run_id=None):
     scores = {}
     if run_id:
         scores = {r["property_id"]: r for r in conn.execute(
-            "SELECT property_id, dealability_score, dealability_reason FROM scores WHERE scrape_run_id=?",
+            "SELECT property_id, dealability_score, dealability_reason, "
+            "distress_score, distress_reason, urgency_score, urgency_reason, "
+            "confidence_score, confidence_reason, contact_priority_score, tier, tier_reason "
+            "FROM scores WHERE scrape_run_id=?",
             (run_id,))}
     by_key = {(r["source_name"], r["doc_num"], r["doc_type"]): (r["property_id"], r["owner_id"]) for r in doc_rows}
     code_conf_by_key = {(r["source_name"], r["doc_num"], r["doc_type"]): r["code_violation_confidence"] for r in doc_rows}
@@ -1083,6 +1086,15 @@ def enrich_records_with_ids(conn, records, run_id=None):
         sc = scores.get(prop_id)
         r["dealability_score"] = sc["dealability_score"] if sc else None
         r["dealability_reason"] = sc["dealability_reason"] if sc else ""
+        r["distress_score"] = sc["distress_score"] if sc else None
+        r["distress_reason"] = sc["distress_reason"] if sc else ""
+        r["urgency_score"] = sc["urgency_score"] if sc else None
+        r["urgency_reason"] = sc["urgency_reason"] if sc else ""
+        r["confidence_score"] = sc["confidence_score"] if sc else None
+        r["confidence_reason"] = sc["confidence_reason"] if sc else ""
+        r["contact_priority_score"] = sc["contact_priority_score"] if sc else None
+        r["tier"] = sc["tier"] if sc else None
+        r["tier_reason"] = sc["tier_reason"] if sc else ""
     return records
 
 

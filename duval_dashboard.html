@@ -232,6 +232,11 @@ td.mono{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nu
 .tier-1{border-color:var(--crit);color:var(--crit);background:color-mix(in srgb, var(--crit) 14%, transparent)}
 .tier-2{border-color:var(--warn);color:var(--warn);background:color-mix(in srgb, var(--warn) 14%, transparent)}
 .tier-3{border-color:var(--muted);color:var(--muted);background:transparent}
+.lead-tier-badge{
+  display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);
+  font-weight:700;font-size:11px;width:24px;height:24px;border-radius:50%;border:2px solid;
+  flex-shrink:0;
+}
 .cat-chip-row{display:flex;flex-wrap:wrap;gap:4px}
 .view-info{
   font-family:var(--mono);font-size:11.5px;color:var(--muted2);margin-block-end:10px;
@@ -413,6 +418,14 @@ tbody tr.is-suppressed{opacity:.45}
     <select id="ptype-filter" title="Florida DOR property use classification. Populated from what's actually in the data.">
       <option value="">All Property Types</option>
     </select>
+    <select id="tier-filter" title="Phase 8 Contact Priority tier -- a weighted blend of Dealability, Distress, Urgency, and Confidence, capped when confidence is too low to act on.">
+      <option value="">All Tiers</option>
+      <option value="A">Tier A</option>
+      <option value="B">Tier B</option>
+      <option value="C">Tier C</option>
+      <option value="D">Tier D</option>
+      <option value="E">Tier E</option>
+    </select>
     <button class="chip" id="addr-filter">Has Address</button>
     <button class="chip" id="review-filter" title="TRUST_OWNERSHIP_REVIEW_REQUIRED or PROPERTY_TYPE_REVIEW_REQUIRED">Review Required Only</button>
     <button class="chip active" id="suppressed-filter">Hide Suppressed</button>
@@ -425,7 +438,7 @@ tbody tr.is-suppressed{opacity:.45}
   <div class="table-wrap">
     <table id="leads-table">
       <thead id="table-head"></thead>
-      <tbody id="leads-body"><tr><td colspan="9" class="no-data">Loading records…</td></tr></tbody>
+      <tbody id="leads-body"><tr><td colspan="10" class="no-data">Loading records…</td></tr></tbody>
     </table>
   </div>
   <div class="pagination" id="pagination"></div>
@@ -524,6 +537,13 @@ function computeCompoundGroups(records){
     const maxScore = Math.max(...distress.map(g=>g.score||0));
     const yearsOwned = Math.max(...distress.map(g=>g.years_owned ?? -1));
     const tier = cats.length>=2 ? 1 : (distress.length>=2 ? 2 : 3);
+    // Phase 8: pull the whole stacked-distress/priority breakdown from
+    // whichever single record has the highest contact_priority_score --
+    // consistent values from one source, not an independent max per
+    // field (which could stitch together a distress score from one
+    // document and a tier_reason that describes a different one).
+    const bestPriority = distress.reduce((best, g) =>
+      (g.contact_priority_score ?? -1) > (best.contact_priority_score ?? -1) ? g : best, distress[0]);
 
     groups.push({
       property_id: distress[0].property_id,
@@ -556,6 +576,15 @@ function computeCompoundGroups(records){
       landlord_portfolio_stage: (distress.find(g=>g.landlord_portfolio_stage && g.landlord_portfolio_stage!=="LANDLORD_STAGE_UNKNOWN")||{}).landlord_portfolio_stage || "LANDLORD_STAGE_UNKNOWN",
       portfolio_property_count: (distress.find(g=>g.portfolio_property_count!=null)||{}).portfolio_property_count ?? null,
       portfolio_distressed_count: (distress.find(g=>g.portfolio_distressed_count!=null)||{}).portfolio_distressed_count ?? null,
+      distress_score: bestPriority.distress_score ?? null,
+      distress_reason: bestPriority.distress_reason || "",
+      urgency_score: bestPriority.urgency_score ?? null,
+      urgency_reason: bestPriority.urgency_reason || "",
+      confidence_score: bestPriority.confidence_score ?? null,
+      confidence_reason: bestPriority.confidence_reason || "",
+      contact_priority_score: bestPriority.contact_priority_score ?? null,
+      lead_tier: bestPriority.tier || null,
+      tier_reason: bestPriority.tier_reason || "",
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -590,7 +619,7 @@ async function loadData(){
   }catch(e){
     console.error(e);
     document.getElementById("leads-body").innerHTML =
-      `<tr><td colspan="9" class="no-data">Could not load records.json — run duval_leads_scraper.py first.</td></tr>`;
+      `<tr><td colspan="10" class="no-data">Could not load records.json — run duval_leads_scraper.py first.</td></tr>`;
   }
 }
 
@@ -661,6 +690,7 @@ function applyFilters(){
   const minS = parseInt(document.getElementById("score-filter").value) || 0;
   const minYears = parseInt(document.getElementById("years-filter").value) || 0;
   const ptype = document.getElementById("ptype-filter").value;
+  const tierWanted = document.getElementById("tier-filter").value;
   const addrOnly = document.getElementById("addr-filter").classList.contains("active");
   const reviewOnly = document.getElementById("review-filter").classList.contains("active");
   const hideSuppressed = document.getElementById("suppressed-filter").classList.contains("active");
@@ -672,6 +702,7 @@ function applyFilters(){
       if(g.max_score < minS) return false;
       if(minYears && (g.years_owned==null || g.years_owned < minYears)) return false;
       if(ptype && g.property_type_label !== ptype) return false;
+      if(tierWanted && g.lead_tier !== tierWanted) return false;
       if(reviewOnly && !isReviewRequired(g.flags)) return false;
       if(q){
         const hay = [g.owner,g.address,g.prop_city,g.prop_zip,g.catLabels.join(" "),g.flags.join(" ")].join(" ").toLowerCase();
@@ -691,6 +722,7 @@ function applyFilters(){
       if(r.score < minS) return false;
       if(minYears && (r.years_owned==null || r.years_owned < minYears)) return false;
       if(ptype && r.property_type_label !== ptype) return false;
+      if(tierWanted && r.tier !== tierWanted) return false;
       if(reviewOnly && !isReviewRequired(r.flags)) return false;
       if(addrOnly && !r.prop_address) return false;
       if(q){
@@ -731,6 +763,7 @@ function fmt$(a){ if(!a) return "–"; return "$"+parseFloat(a).toLocaleString("
 
 const FILINGS_COLS = [
   {col:"score", label:"Score"},
+  {col:"contact_priority_score", label:"Priority"},
   {col:"cat_label", label:"Type"},
   {col:"doc_num", label:"Doc #"},
   {col:"filed", label:"Filed"},
@@ -742,6 +775,7 @@ const FILINGS_COLS = [
 ];
 const COMPOUND_COLS = [
   {col:"tier", label:"Tier"},
+  {col:"contact_priority_score", label:"Priority"},
   {col:"address", label:"Property Address"},
   {col:null, label:"Distress Types"},
   {col:"filing_count", label:"Filings"},
@@ -779,7 +813,7 @@ function renderFilingsRows(){
   const slice = filtered.slice(start, start+PAGE_SIZE);
 
   if(!slice.length){
-    tbody.innerHTML = `<tr><td colspan="9" class="no-data">No records match your filters.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="no-data">No records match your filters.</td></tr>`;
     return;
   }
 
@@ -790,6 +824,7 @@ function renderFilingsRows(){
     const suppressed = isSuppressed(r.property_id);
     return `<tr data-idx="${start+i}"${suppressed?' class="is-suppressed"':''}>
       <td><div class="seal ${sealClass(sc)}">${sc}</div></td>
+      <td>${leadTierBadgeHtml(r.tier, r.contact_priority_score)}</td>
       <td><span class="tab ${catClass(r.cat)}">${r.cat_label||r.doc_type||"–"}</span>${timelineCountdownBadgeHtml(r)}${suppressed?'<span class="badge-suppressed">Suppressed</span>':''}</td>
       <td class="mono">${r.doc_num||"–"}</td>
       <td class="mono">${r.filed||"–"}</td>
@@ -814,7 +849,7 @@ function renderCompoundRows(){
   const slice = filtered.slice(start, start+PAGE_SIZE);
 
   if(!slice.length){
-    tbody.innerHTML = `<tr><td colspan="8" class="no-data">No properties match your filters.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="no-data">No properties match your filters.</td></tr>`;
     return;
   }
 
@@ -825,6 +860,7 @@ function renderCompoundRows(){
     const suppressed = isSuppressed(g.property_id);
     return `<tr data-idx="${start+i}"${suppressed?' class="is-suppressed"':''}>
       <td><div class="tier-badge tier-${g.tier}">${g.tier}</div>${suppressed?'<span class="badge-suppressed">Suppr.</span>':''}</td>
+      <td>${leadTierBadgeHtml(g.lead_tier, g.contact_priority_score)}</td>
       <td class="addr-cell">${addr}</td>
       <td><div class="cat-chip-row">${g.cats.map(c=>`<span class="tab ${catClass(c)}">${c.replace('_',' ')}</span>`).join("")}${timelineCountdownBadgeHtml(g)}</div></td>
       <td class="mono">${g.filing_count}</td>
@@ -872,6 +908,17 @@ function dealabilityColor(s){
   if(s>=60) return "var(--good)";
   if(s>=35) return "var(--warn)";
   return "var(--crit)";
+}
+
+// Phase 8: Contact Priority tier (A-E) -- distinct from the Compound
+// Distress view's 1/2/3 tier (number of distress signals stacked on one
+// property). A blends Dealability, Distress, Urgency and Confidence;
+// see the Stacked Distress & Priority modal section for the breakdown.
+const LEAD_TIER_COLOR = {A:"var(--good)", B:"var(--blue)", C:"var(--warn)", D:"var(--crit)", E:"var(--muted)"};
+function leadTierBadgeHtml(tierLetter, priorityScore){
+  if(!tierLetter) return `<div class="lead-tier-badge" style="border-color:var(--muted);color:var(--muted)" title="No Contact Priority score computed yet">–</div>`;
+  const color = LEAD_TIER_COLOR[tierLetter] || "var(--muted)";
+  return `<div class="lead-tier-badge" style="border-color:${color};color:${color};background:color-mix(in srgb, ${color} 12%, transparent)" title="Contact Priority ${priorityScore!=null?priorityScore+'/100':''} -- Tier ${tierLetter}">${tierLetter}</div>`;
 }
 
 // Phase 3: valuation + Dealability Score. Assessed and Just/Market Value
@@ -1069,6 +1116,44 @@ function sellerProfileHtml(r){
   `;
 }
 
+// Phase 8: stacked-distress scoring, urgency, confidence, and contact
+// priority -- where every signal from Phases 2-7 finally gets consumed.
+// Dealability (Phase 3) answers "is this a workable deal"; Distress
+// answers "how much real trouble is this property in" (breadth + depth
+// of active distress categories); Urgency is the mirror image of
+// Dealability's closing-runway component (imminent = high urgency here,
+// not low points); Confidence is data-quality/contactability, not deal
+// quality. Contact Priority blends all four and is capped when
+// confidence is too low to act on regardless of how good the deal looks.
+function stackedDistressHtml(r){
+  const hasAny = r.distress_score != null || r.urgency_score != null || r.confidence_score != null;
+  if(!hasAny) return "";
+  const scores = [
+    {label:"Dealability", value:r.dealability_score, hint:"Deal feasibility"},
+    {label:"Distress", value:r.distress_score, hint:"Breadth + depth of active distress"},
+    {label:"Urgency", value:r.urgency_score, hint:"Time pressure -- imminent = high"},
+    {label:"Confidence", value:r.confidence_score, hint:"Data quality / contactability"},
+  ];
+  const scoreRow = scores.map(s=>`
+    <div style="text-align:center;flex:1;min-width:70px">
+      <div class="dealability-badge" style="width:36px;height:36px;font-size:12px;margin:0 auto;border-color:${dealabilityColor(s.value)};color:${dealabilityColor(s.value)};background:color-mix(in srgb, ${dealabilityColor(s.value)} 12%, transparent)" title="${s.hint}">${s.value!=null?s.value:"–"}</div>
+      <div style="font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:4px">${s.label}</div>
+    </div>`).join("");
+  return `
+    <div class="msection"><h4>Stacked Distress &amp; Priority</h4>
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
+        ${scoreRow}
+        <div style="text-align:center;flex:1;min-width:70px">
+          ${leadTierBadgeHtml(r.tier, r.contact_priority_score)}
+          <div style="font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:4px">Priority</div>
+        </div>
+      </div>
+      ${r.tier_reason?`<div class="dealability-reason">${r.tier_reason}</div>`:""}
+      ${[r.distress_reason, r.urgency_reason, r.confidence_reason].filter(Boolean).map(x=>`<div style="font-size:11px;color:var(--muted2);margin-top:6px">• ${x}</div>`).join("")}
+    </div>
+  `;
+}
+
 function reviewBadgesHtml(flags){
   flags = flags || [];
   const badges = [];
@@ -1118,6 +1203,7 @@ function openModal(r){
     ${foreclosureTimelineHtml(r)}
     ${codeEnforcementTimelineHtml(r)}
     ${sellerProfileHtml(r)}
+    ${stackedDistressHtml(r)}
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(r.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
     </div>
@@ -1168,6 +1254,7 @@ function openCompoundModal(g){
     ${foreclosureTimelineHtml(g)}
     ${codeEnforcementTimelineHtml(g)}
     ${sellerProfileHtml(g)}
+    ${stackedDistressHtml({...g, tier: g.lead_tier})}
     <div class="msection"><h4>All Filings At This Address</h4>
       <ul class="filing-list">${filingsHtml}</ul>
     </div>
@@ -1308,6 +1395,7 @@ document.getElementById("cat-filter").addEventListener("change", applyFilters);
 document.getElementById("score-filter").addEventListener("change", applyFilters);
 document.getElementById("years-filter").addEventListener("change", applyFilters);
 document.getElementById("ptype-filter").addEventListener("change", applyFilters);
+document.getElementById("tier-filter").addEventListener("change", applyFilters);
 document.getElementById("addr-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });
 document.getElementById("review-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });
 document.getElementById("suppressed-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });

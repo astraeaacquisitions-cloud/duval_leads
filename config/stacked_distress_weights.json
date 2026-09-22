@@ -1,0 +1,68 @@
+{
+  "_comment": "Phase 8: stacked-distress scoring, urgency, confidence, and contact-priority weights. Built entirely from signals already computed in Phases 2-7 (property-type fit, equity/dealability, tax-deed and foreclosure timelines, code enforcement, absentee/landlord/probate) -- no new data source. This is where those signals finally get consumed: Dealability answers 'is this a workable deal', Distress answers 'how much real legal/financial trouble is this property in', Urgency answers 'how soon might something irreversible happen' (the mirror image of Dealability's closing-runway component -- imminent scores HIGH here, not low), and Confidence answers 'how well do we actually know this lead, and can we identify who to contact'.",
+
+  "distress": {
+    "_comment": "0-100. Rewards BOTH breadth (distinct distress categories on one property -- the Compound Distress view's Tier 1/2/3 concept) and depth (advanced-stage signals from Phases 4-6).",
+    "distinct_categories_points": {"1": 10, "2": 25, "3+": 40},
+    "document_count_points": {"1": 5, "2-3": 15, "4+": 30},
+    "advanced_stage_bonus": {
+      "tax_imminent_or_past": 15,
+      "foreclosure_judgment": 15,
+      "code_enforcement_repeat": 10
+    }
+  },
+
+  "urgency": {
+    "_comment": "0-100. The mirror image of Dealability's closing-runway component: an imminent tax deed auction or a recently entered foreclosure judgment means LOW time to close (bad for dealability) but HIGH urgency (a highly motivated seller, or a deal that will disappear if not acted on now). Tax-deed timeline takes precedence over foreclosure timeline when a property has both, matching Dealability's own precedence (tax has an exact date, foreclosure doesn't).",
+    "tax_stage_points": {
+      "TAX_STAGE_IMMINENT": 100,
+      "TAX_STAGE_PAST_UNVERIFIED": 90,
+      "TAX_STAGE_SOON": 65,
+      "TAX_STAGE_FAR": 30
+    },
+    "foreclosure_stage_points": {
+      "FORECLOSURE_STAGE_JUDGMENT_ENTERED": 90,
+      "FORECLOSURE_STAGE_JUDGMENT_STALE": 75,
+      "FORECLOSURE_STAGE_FILED": 40
+    },
+    "code_enforcement_repeat_bonus": 10,
+    "no_timeline_baseline": 15,
+    "_no_timeline_baseline_comment": "Applied when neither tax-deed nor foreclosure timeline data exists for this property but it's still an active lead (lien/judgment/code violation/probate only) -- a smaller, real baseline, not zero, since those categories still carry some time pressure even without a known date."
+  },
+
+  "confidence": {
+    "_comment": "0-100. Data-quality/contactability, NOT deal quality -- a high Dealability Score on a lead we can't actually verify or identify who to contact isn't a real opportunity yet.",
+    "address_match_points": {
+      "verified_parcel": 40, "address_only": 25, "unmatched": 0
+    },
+    "owner_identity_points": {
+      "name_and_mailing_address": 30, "name_and_property_only": 18,
+      "name_only_unmerged": 8, "unmatched": 0
+    },
+    "value_confidence_points": {"matched": 20, "unmatched": 0},
+    "review_flag_penalty": 5,
+    "_review_flag_penalty_comment": "Subtracted once per review-required flag present (TRUST_OWNERSHIP_REVIEW_REQUIRED, PROBATE_REPRESENTATIVE_REVIEW_REQUIRED, PROPERTY_TYPE_REVIEW_REQUIRED) -- we know less about who can actually transact until that's resolved.",
+    "base_points": 10
+  },
+
+  "contact_priority": {
+    "_comment": "0-100. The master ranking, blending all four scores. Weights sum to 1.0.",
+    "dealability_weight": 0.35,
+    "distress_weight": 0.20,
+    "urgency_weight": 0.30,
+    "confidence_weight": 0.15,
+    "low_confidence_cap": {
+      "threshold": 25,
+      "cap": 50,
+      "_comment": "A lead we can't verify or don't know who to contact can't be a top priority no matter how distressed or urgent it looks -- capped, not zeroed, since it's still worth researching."
+    }
+  },
+
+  "tiers": {
+    "_comment": "Contact Priority Score cutoffs. A (call today) down to E (low priority / needs more research).",
+    "A": 80,
+    "B": 65,
+    "C": 50,
+    "D": 30
+  }
+}
