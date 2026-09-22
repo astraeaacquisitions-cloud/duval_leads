@@ -857,6 +857,14 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
             flags.append("PROPERTY_TYPE_REVIEW_REQUIRED")
         if is_teardown_infill_candidate(match.get("property_use_code", ""), match.get("year_built"), match.get("building_count")):
             flags.append("TEARDOWN_INFILL_CANDIDATE")
+        if cat == "probate":
+            # DirectName here is conventionally the decedent (e.g. "SMITH
+            # JOHN DECEASED") -- a legitimate estate-sale lead, but never
+            # a contactable person. Same discipline as trust ownership:
+            # flag for review, never assume a relative/heir/occupant has
+            # authority to sell without confirming the actual personal
+            # representative.
+            flags.append("PROBATE_REPRESENTATIVE_REVIEW_REQUIRED")
 
         record = {
             "doc_num": doc_num,
@@ -1025,7 +1033,9 @@ def enrich_records_with_ids(conn, records, run_id=None):
         "active_lien_count, has_tax_distress, mortgage_estimate, "
         "tax_deed_stage, days_until_tax_sale, "
         "foreclosure_stage, days_since_foreclosure_milestone, "
-        "code_enforcement_stage, code_violation_count FROM valuations")}
+        "code_enforcement_stage, code_violation_count, "
+        "absentee_stage, landlord_portfolio_stage, portfolio_property_count, portfolio_distressed_count "
+        "FROM valuations")}
     scores = {}
     if run_id:
         scores = {r["property_id"]: r for r in conn.execute(
@@ -1060,6 +1070,15 @@ def enrich_records_with_ids(conn, records, run_id=None):
         r["code_violation_confidence"] = code_conf_by_key.get((r.get("source", ""), r.get("doc_num", ""), r.get("doc_type", "")))
         if r["code_enforcement_stage"] == "CODE_STAGE_REPEAT" and "CHRONIC_CODE_VIOLATIONS" not in r.get("flags", []):
             r.setdefault("flags", []).append("CHRONIC_CODE_VIOLATIONS")
+
+        r["absentee_stage"] = val["absentee_stage"] if val and val["absentee_stage"] else "ABSENTEE_STAGE_UNKNOWN"
+        r["landlord_portfolio_stage"] = val["landlord_portfolio_stage"] if val and val["landlord_portfolio_stage"] else "LANDLORD_STAGE_UNKNOWN"
+        r["portfolio_property_count"] = val["portfolio_property_count"] if val else None
+        r["portfolio_distressed_count"] = val["portfolio_distressed_count"] if val else None
+        if r["absentee_stage"] == "ABSENTEE_STAGE_OUT_OF_STATE" and "OUT_OF_STATE_OWNER" not in r.get("flags", []):
+            r.setdefault("flags", []).append("OUT_OF_STATE_OWNER")
+        if r["landlord_portfolio_stage"] == "LANDLORD_STAGE_MULTI_PROPERTY_DISTRESS" and "LANDLORD_MULTI_PROPERTY_DISTRESS" not in r.get("flags", []):
+            r.setdefault("flags", []).append("LANDLORD_MULTI_PROPERTY_DISTRESS")
 
         sc = scores.get(prop_id)
         r["dealability_score"] = sc["dealability_score"] if sc else None

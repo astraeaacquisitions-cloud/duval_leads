@@ -552,6 +552,10 @@ function computeCompoundGroups(records){
       days_since_foreclosure_milestone: (distress.find(g=>g.days_since_foreclosure_milestone!=null)||{}).days_since_foreclosure_milestone ?? null,
       code_enforcement_stage: (distress.find(g=>g.code_enforcement_stage && g.code_enforcement_stage!=="CODE_STAGE_NONE")||{}).code_enforcement_stage || "CODE_STAGE_NONE",
       code_violation_count: (distress.find(g=>g.code_violation_count!=null)||{}).code_violation_count ?? null,
+      absentee_stage: (distress.find(g=>g.absentee_stage && g.absentee_stage!=="ABSENTEE_STAGE_UNKNOWN")||{}).absentee_stage || "ABSENTEE_STAGE_UNKNOWN",
+      landlord_portfolio_stage: (distress.find(g=>g.landlord_portfolio_stage && g.landlord_portfolio_stage!=="LANDLORD_STAGE_UNKNOWN")||{}).landlord_portfolio_stage || "LANDLORD_STAGE_UNKNOWN",
+      portfolio_property_count: (distress.find(g=>g.portfolio_property_count!=null)||{}).portfolio_property_count ?? null,
+      portfolio_distressed_count: (distress.find(g=>g.portfolio_distressed_count!=null)||{}).portfolio_distressed_count ?? null,
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -646,7 +650,7 @@ function isSuppressed(propertyId){
   return !!(s && s.suppressed);
 }
 
-const REVIEW_FLAGS = ["TRUST_OWNERSHIP_REVIEW_REQUIRED", "PROPERTY_TYPE_REVIEW_REQUIRED"];
+const REVIEW_FLAGS = ["TRUST_OWNERSHIP_REVIEW_REQUIRED", "PROPERTY_TYPE_REVIEW_REQUIRED", "PROBATE_REPRESENTATIVE_REVIEW_REQUIRED"];
 function isReviewRequired(flags){
   return (flags||[]).some(f=>REVIEW_FLAGS.includes(f));
 }
@@ -1026,6 +1030,45 @@ function codeEnforcementTimelineHtml(r){
   `;
 }
 
+const ABSENTEE_STAGE_META = {
+  ABSENTEE_STAGE_OUT_OF_STATE:          {color:"var(--crit)",  label:"Out-of-State Owner"},
+  ABSENTEE_STAGE_LOCAL_ABSENTEE:        {color:"var(--warn)",  label:"Local Absentee Owner"},
+  ABSENTEE_STAGE_OWNER_OCCUPIED_LIKELY: {color:"var(--good)",  label:"Likely Owner-Occupied"},
+};
+const LANDLORD_STAGE_META = {
+  LANDLORD_STAGE_MULTI_PROPERTY_DISTRESS: {color:"var(--crit)", label:"Portfolio Owner -- Multiple Distressed"},
+  LANDLORD_STAGE_MULTI_PROPERTY:          {color:"var(--warn)", label:"Portfolio Owner"},
+  LANDLORD_STAGE_SINGLE:                  {color:"var(--muted)",label:"Single Property"},
+};
+
+// Phase 7: seller-profile signals (absentee ownership, landlord
+// portfolio/fatigue), built entirely from address and ownership data
+// already scraped -- no new source. Eviction filings and vacancy status
+// are never shown here: this pipeline has no scraped source for either
+// (see README), so nothing is fabricated to fill that gap. Portfolio
+// counts are a floor, not a ceiling -- this pipeline's owner-identity
+// matching is deliberately conservative, so the real portfolio could be
+// larger than what's shown.
+function sellerProfileHtml(r){
+  const aStage = r.absentee_stage || "ABSENTEE_STAGE_UNKNOWN";
+  const lStage = r.landlord_portfolio_stage || "LANDLORD_STAGE_UNKNOWN";
+  if(aStage === "ABSENTEE_STAGE_UNKNOWN" && (lStage === "LANDLORD_STAGE_UNKNOWN" || lStage === "LANDLORD_STAGE_SINGLE")) return "";
+  const aMeta = ABSENTEE_STAGE_META[aStage];
+  const lMeta = LANDLORD_STAGE_META[lStage];
+  const count = r.portfolio_property_count;
+  const distressed = r.portfolio_distressed_count;
+  return `
+    <div class="msection"><h4>Seller Profile</h4>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        ${aMeta?`<span class="equity-signal" style="border-color:${aMeta.color};color:${aMeta.color}">${aMeta.label}</span>`:""}
+        ${lMeta && lStage!=="LANDLORD_STAGE_UNKNOWN"?`<span class="equity-signal" style="border-color:${lMeta.color};color:${lMeta.color}">${lMeta.label}</span>`:""}
+      </div>
+      ${count!=null?`<div style="font-size:11px;color:var(--muted2);margin-top:8px">${count} propert${count===1?"y":"ies"} on file for this owner in this pipeline's data${distressed?`, ${distressed} currently carrying active distress`:""} -- a floor, not a ceiling (owner-identity matching here is deliberately conservative).</div>`:""}
+      ${lStage==="LANDLORD_STAGE_MULTI_PROPERTY_DISTRESS"?`<div class="value-warning" style="margin-top:8px">This owner has more than one property currently in distress -- a portfolio-wide pattern, not an isolated case.</div>`:""}
+    </div>
+  `;
+}
+
 function reviewBadgesHtml(flags){
   flags = flags || [];
   const badges = [];
@@ -1037,6 +1080,12 @@ function reviewBadgesHtml(flags){
     badges.push(`<span class="badge-confidence">⚑ Possible teardown/infill candidate</span>`);
   if(flags.includes("CHRONIC_CODE_VIOLATIONS"))
     badges.push(`<span class="badge-trust">⚑ Chronic code violations -- see Code Enforcement below</span>`);
+  if(flags.includes("PROBATE_REPRESENTATIVE_REVIEW_REQUIRED"))
+    badges.push(`<span class="badge-trust">⚑ Probate -- identify personal representative before contact</span>`);
+  if(flags.includes("OUT_OF_STATE_OWNER"))
+    badges.push(`<span class="badge-confidence">⚑ Out-of-state owner -- see Seller Profile below</span>`);
+  if(flags.includes("LANDLORD_MULTI_PROPERTY_DISTRESS"))
+    badges.push(`<span class="badge-trust">⚑ Portfolio owner, multiple distressed -- see Seller Profile below</span>`);
   return badges.length ? `<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">${badges.join("")}</div>` : "";
 }
 
@@ -1068,6 +1117,7 @@ function openModal(r){
     ${taxDeedTimelineHtml(r)}
     ${foreclosureTimelineHtml(r)}
     ${codeEnforcementTimelineHtml(r)}
+    ${sellerProfileHtml(r)}
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(r.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
     </div>
@@ -1117,6 +1167,7 @@ function openCompoundModal(g){
     ${taxDeedTimelineHtml(g)}
     ${foreclosureTimelineHtml(g)}
     ${codeEnforcementTimelineHtml(g)}
+    ${sellerProfileHtml(g)}
     <div class="msection"><h4>All Filings At This Address</h4>
       <ul class="filing-list">${filingsHtml}</ul>
     </div>

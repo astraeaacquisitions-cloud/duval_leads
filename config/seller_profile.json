@@ -1,0 +1,6 @@
+{
+  "_comment": "Phase 7 seller-profile signals: absentee ownership and landlord portfolio/fatigue, built entirely from address and ownership data already scraped and persisted (no new source). Eviction filings and vacancy status are NOT tracked -- Duval's Official Records has no eviction/landlord-tenant case data (that lives in a separate court case management system this pipeline does not scrape) and there is no free vacancy-verification source, so neither is claimed anywhere.",
+
+  "landlord_multi_property_threshold": 2,
+  "_landlord_multi_property_threshold_comment": "Number of DISTINCT properties (in this pipeline's own conservative identity matching -- a floor, not a ceiling, since under-merging owner identity is deliberate, see duval_leads_db.py's module docstring) linked to the same owner before treating them as a portfolio owner rather than a single-property seller."
+}

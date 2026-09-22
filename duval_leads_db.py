@@ -278,6 +278,10 @@ CREATE TABLE IF NOT EXISTS valuations (
     days_since_foreclosure_milestone INTEGER,
     code_enforcement_stage TEXT,
     code_violation_count INTEGER,
+    absentee_stage TEXT,
+    landlord_portfolio_stage TEXT,
+    portfolio_property_count INTEGER,
+    portfolio_distressed_count INTEGER,
     computed_at TEXT
 );
 
@@ -382,6 +386,10 @@ SCHEMA_MIGRATIONS = [
     ("documents", "code_violation_confidence", "TEXT"),
     ("valuations", "code_enforcement_stage", "TEXT"),
     ("valuations", "code_violation_count", "INTEGER"),
+    ("valuations", "absentee_stage", "TEXT"),
+    ("valuations", "landlord_portfolio_stage", "TEXT"),
+    ("valuations", "portfolio_property_count", "INTEGER"),
+    ("valuations", "portfolio_distressed_count", "INTEGER"),
 ]
 
 
@@ -675,6 +683,19 @@ def persist_records(conn, records, run_id, source_note=""):
                 conn, "verify_trust_authority", property_id=prop_id, owner_id=owner_id,
                 description=f"TRUST_OWNERSHIP_REVIEW_REQUIRED: confirm trustee identity and authority "
                              f"to sell for {owner_name!r} before treating any contact as decision-maker.",
+                priority="normal",
+            )
+
+        if r.get("cat") == "probate" and prop_id:
+            # DirectName on a probate record is conventionally the decedent --
+            # a legitimate estate-sale lead, but not a person anyone can
+            # contact. Same discipline as trust ownership: flag for review,
+            # never assume a relative/heir/occupant has authority to sell.
+            _add_research_task_if_absent(
+                conn, "verify_probate_representative", property_id=prop_id, owner_id=owner_id,
+                description=f"PROBATE_REPRESENTATIVE_REVIEW_REQUIRED: {owner_name!r} is recorded as the "
+                             f"decedent -- identify the actual personal representative/heir with authority "
+                             f"to sell before treating any contact as decision-maker.",
                 priority="normal",
             )
 
@@ -1047,6 +1068,123 @@ def compute_code_enforcement_signal(conn, property_id, config=None, today=None):
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 7: seller-profile signals -- absentee ownership and landlord
+# portfolio/fatigue. Built entirely from address and ownership data
+# already scraped and persisted (no new source, no network call). Like
+# Phase 6, deliberately NOT wired into the Dealability Score -- these are
+# seller-distress/motivation signals for the stacked-distress/contact-
+# priority engine (a later phase), not deal-feasibility ones.
+#
+# Eviction filings and vacancy status are explicitly NOT built here:
+# Duval's Official Records has no eviction/landlord-tenant case data
+# (that lives in a separate court case management system this pipeline
+# doesn't scrape) and there's no free, reliable vacancy-verification
+# source -- fabricating either would violate the same "never claim data
+# we don't have" discipline as every prior phase.
+# ---------------------------------------------------------------------------
+
+SELLER_PROFILE_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "seller_profile.json"
+)
+
+
+def load_seller_profile_config(path=SELLER_PROFILE_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+SELLER_PROFILE_CONFIG = load_seller_profile_config()
+
+
+def compute_absentee_signal(conn, property_id):
+    """Returns (stage, reasoning). Compares each current owner's mailing
+    address against the property's own situs address (reusing _norm(),
+    the same normalization used for identity hashing, so trivial
+    formatting differences don't produce a false absentee flag). Missing
+    address data is UNKNOWN, never silently treated as owner-occupied."""
+    prop = conn.execute(
+        "SELECT situs_address FROM properties WHERE id=?", (property_id,)
+    ).fetchone()
+    owners = conn.execute(
+        "SELECT o.mailing_address, o.mailing_state FROM ownerships ow "
+        "JOIN owners o ON o.id = ow.owner_id WHERE ow.property_id=?",
+        (property_id,),
+    ).fetchall()
+
+    if not prop or not prop["situs_address"] or not owners:
+        return "ABSENTEE_STAGE_UNKNOWN", "Insufficient address data to compare owner mailing address against the property address."
+
+    situs_norm = _norm(prop["situs_address"])
+    any_matched = False
+    any_out_of_state = False
+    any_local_absentee = False
+    for o in owners:
+        mail_addr = o["mailing_address"] or ""
+        if not mail_addr:
+            continue
+        if _norm(mail_addr) == situs_norm:
+            any_matched = True
+            continue
+        if (o["mailing_state"] or "").strip().upper() not in ("FL", ""):
+            any_out_of_state = True
+        else:
+            any_local_absentee = True
+
+    if not any_matched and not any_out_of_state and not any_local_absentee:
+        return "ABSENTEE_STAGE_UNKNOWN", "No owner mailing address on file to compare against the property address."
+    if any_out_of_state:
+        return "ABSENTEE_STAGE_OUT_OF_STATE", "Owner's mailing address is outside Florida -- the strongest absentee signal (a distant property is harder to manage or maintain)."
+    if any_local_absentee:
+        return "ABSENTEE_STAGE_LOCAL_ABSENTEE", "Owner's mailing address differs from the property address but is still in Florida -- owns it without living there (rental, inherited, or second property)."
+    return "ABSENTEE_STAGE_OWNER_OCCUPIED_LIKELY", "Owner's mailing address matches the property address -- likely owner-occupied."
+
+
+def compute_landlord_portfolio_signal(conn, property_id, config=None):
+    """Returns (stage, portfolio_property_count, portfolio_distressed_count,
+    reasoning). Counts DISTINCT properties linked to the same owner(s) as
+    this property, in this pipeline's own (deliberately conservative)
+    owner identity matching -- a floor on real portfolio size, not a
+    ceiling, since under-merging owner identity is intentional (see the
+    module docstring)."""
+    config = config if config is not None else SELLER_PROFILE_CONFIG
+    threshold = config.get("landlord_multi_property_threshold", 2)
+
+    owner_ids = [r["owner_id"] for r in conn.execute(
+        "SELECT DISTINCT owner_id FROM ownerships WHERE property_id=?", (property_id,)
+    )]
+    if not owner_ids:
+        return "LANDLORD_STAGE_UNKNOWN", 0, 0, "No confirmed owner on file to check for other properties."
+
+    placeholders = ",".join("?" for _ in owner_ids)
+    portfolio_props = {r["property_id"] for r in conn.execute(
+        f"SELECT DISTINCT property_id FROM ownerships WHERE owner_id IN ({placeholders})", owner_ids
+    )}
+    portfolio_count = len(portfolio_props)
+
+    if portfolio_count < threshold:
+        return "LANDLORD_STAGE_SINGLE", portfolio_count, 0, "Only one property on file for this owner -- no portfolio pattern detected."
+
+    prop_placeholders = ",".join("?" for _ in portfolio_props)
+    cat_placeholders = ",".join("?" for _ in ACTIVE_LIEN_CATS)
+    distressed_props = {r["property_id"] for r in conn.execute(
+        f"SELECT DISTINCT property_id FROM documents WHERE property_id IN ({prop_placeholders}) "
+        f"AND cat IN ({cat_placeholders})",
+        (*portfolio_props, *ACTIVE_LIEN_CATS),
+    )}
+    distressed_count = len(distressed_props)
+
+    if distressed_count >= threshold:
+        return "LANDLORD_STAGE_MULTI_PROPERTY_DISTRESS", portfolio_count, distressed_count, (
+            f"{distressed_count} of this owner's {portfolio_count} known properties carry active distress "
+            "documents -- a portfolio owner facing trouble on multiple holdings at once, not an isolated case."
+        )
+    return "LANDLORD_STAGE_MULTI_PROPERTY", portfolio_count, distressed_count, (
+        f"This owner has {portfolio_count} properties on file in this pipeline's data, but only this one "
+        "currently carries an active distress document."
+    )
+
+
 def compute_dealability_score(conn, property_id, config=None):
     """Computes the Dealability Score (0-100) for one property from
     what's already in the database -- no network calls. Returns
@@ -1205,17 +1343,23 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
          tax_stage, days_until_tax_sale, foreclosure_stage, days_since_foreclosure_milestone) = \
             compute_dealability_score(conn, property_id, config)
         code_stage, code_count, _code_days, _code_reason = compute_code_enforcement_signal(conn, property_id)
+        absentee_stage, _absentee_reason = compute_absentee_signal(conn, property_id)
+        landlord_stage, portfolio_count, portfolio_distressed_count, _landlord_reason = \
+            compute_landlord_portfolio_signal(conn, property_id)
         conn.execute(
             "UPDATE valuations SET active_lien_count=?, has_tax_distress=?, "
             "equity_signal=?, equity_confidence=?, equity_reasoning=?, "
             "tax_deed_stage=?, days_until_tax_sale=?, "
             "foreclosure_stage=?, days_since_foreclosure_milestone=?, "
             "code_enforcement_stage=?, code_violation_count=?, "
+            "absentee_stage=?, landlord_portfolio_stage=?, "
+            "portfolio_property_count=?, portfolio_distressed_count=?, "
             "value_confidence=?, computed_at=? WHERE property_id=?",
             (lien_count, int(has_tax), signal, eq_conf, eq_reason,
              tax_stage, days_until_tax_sale,
              foreclosure_stage, days_since_foreclosure_milestone,
              code_stage, code_count,
+             absentee_stage, landlord_stage, portfolio_count, portfolio_distressed_count,
              "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN", ts, property_id),
         )
         conn.execute(
@@ -1338,6 +1482,7 @@ def export_csv(conn, path):
         "v.active_lien_count, v.mortgage_estimate, v.tax_deed_stage, v.days_until_tax_sale, "
         "v.foreclosure_stage, v.days_since_foreclosure_milestone, "
         "v.code_enforcement_stage, v.code_violation_count, "
+        "v.absentee_stage, v.landlord_portfolio_stage, v.portfolio_property_count, v.portfolio_distressed_count, "
         "(SELECT dealability_score FROM scores s WHERE s.property_id = p.id "
         " ORDER BY computed_at DESC LIMIT 1) AS dealability_score "
         "FROM documents d "
@@ -1355,6 +1500,7 @@ def export_csv(conn, path):
             "Active Lien Count", "Mortgage Estimate", "Tax Deed Stage", "Days Until Tax Sale",
             "Foreclosure Stage", "Days Since Foreclosure Milestone",
             "Code Enforcement Stage", "Code Violation Count", "Code Violation Confidence (this document)",
+            "Absentee Owner Stage", "Landlord Portfolio Stage", "Portfolio Property Count", "Portfolio Distressed Count",
             "Dealability Score",
             "Suppressed", "Category", "Document Type", "Filed Date",
             "Document Number", "Amount", "Legal Description", "Flags", "Legacy Score", "Source",
@@ -1384,6 +1530,10 @@ def export_csv(conn, path):
                 r["code_enforcement_stage"] or "CODE_STAGE_NONE",
                 r["code_violation_count"] if r["code_violation_count"] is not None else "",
                 r["code_violation_confidence"] or "",
+                r["absentee_stage"] or "ABSENTEE_STAGE_UNKNOWN",
+                r["landlord_portfolio_stage"] or "LANDLORD_STAGE_UNKNOWN",
+                r["portfolio_property_count"] if r["portfolio_property_count"] is not None else "",
+                r["portfolio_distressed_count"] if r["portfolio_distressed_count"] is not None else "",
                 r["dealability_score"] if r["dealability_score"] is not None else "",
                 "yes" if r["property_id"] in suppressed_props else "no",
                 r["cat"] or "", r["doc_type"] or "", r["filed_date"] or "", r["doc_num"] or "",

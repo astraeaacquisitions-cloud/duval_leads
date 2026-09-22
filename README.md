@@ -35,6 +35,8 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
   per stage.
 - `config/code_enforcement.json` -- Phase 6 code enforcement signal
   thresholds (the "recent vs. aged" single-violation cutoff).
+- `config/seller_profile.json` -- Phase 7 seller-profile thresholds (the
+  multi-property portfolio cutoff).
 
 ## Property-type classification (Phase 2)
 
@@ -262,6 +264,74 @@ tracking lives on a separate system from the Official Records lien
 search this pipeline reads. Every stage and label here is built strictly
 from the fact that a municipal lien was recorded, and how many times,
 never from a fabricated case status.
+
+## Seller Profile Signals (Phase 7)
+
+Every property now also carries an `absentee_stage`, a
+`landlord_portfolio_stage`, and (when portfolio data applies)
+`portfolio_property_count`/`portfolio_distressed_count`, computed in
+`compute_absentee_signal()` and `compute_landlord_portfolio_signal()`
+(`duval_leads_db.py`), config-driven via `config/seller_profile.json`.
+Probate leads also now generate a research task and a
+`PROBATE_REPRESENTATIVE_REVIEW_REQUIRED` flag.
+
+**Absentee ownership** compares each current owner's mailing address
+against the property's own situs address (normalized the same way
+identity hashing already is, so formatting differences don't produce a
+false flag):
+
+- `ABSENTEE_STAGE_OWNER_OCCUPIED_LIKELY` -- mailing address matches the
+  property address.
+- `ABSENTEE_STAGE_LOCAL_ABSENTEE` -- mailing address differs but is
+  still in Florida.
+- `ABSENTEE_STAGE_OUT_OF_STATE` -- mailing address is outside Florida,
+  sets the `OUT_OF_STATE_OWNER` flag. The strongest absentee signal: a
+  distant property is genuinely harder to manage or maintain.
+- `ABSENTEE_STAGE_UNKNOWN` -- insufficient address data to compare.
+  Missing data is never silently treated as owner-occupied.
+
+**Landlord portfolio / fatigue** counts DISTINCT properties linked to
+the same owner(s) in this pipeline's own data:
+
+- `LANDLORD_STAGE_SINGLE` -- only one property on file for this owner.
+- `LANDLORD_STAGE_MULTI_PROPERTY` -- 2+ properties on file, but only
+  this one currently carries an active distress document.
+- `LANDLORD_STAGE_MULTI_PROPERTY_DISTRESS` -- 2+ of this owner's
+  properties currently carry an active distress document at once (sets
+  `LANDLORD_MULTI_PROPERTY_DISTRESS`) -- a portfolio owner facing
+  trouble on multiple holdings simultaneously, the real signal behind
+  "landlord fatigue," not an isolated case.
+- `LANDLORD_STAGE_UNKNOWN` -- no confirmed owner on file.
+
+**Portfolio counts are a floor, not a ceiling.** This pipeline's owner
+identity matching is deliberately conservative (see "Identity model" in
+`duval_leads_db.py`'s module docstring) -- under-merging is a research
+task later; over-merging corrupts identity data silently, which is much
+worse. So the same real landlord could show up as several different
+`owner_id`s across inconsistently formatted filings, and this signal
+would under-count their true portfolio. Documented here rather than
+overstated in the UI.
+
+**Probate:** the party named on a probate record (`DirectName`) is
+conventionally the decedent -- a legitimate estate-sale lead, but never
+a contactable person. Same discipline as trust ownership (Phase 1): a
+`verify_probate_representative` research task and
+`PROBATE_REPRESENTATIVE_REVIEW_REQUIRED` flag are generated so nobody
+assumes a relative, heir, or occupant has authority to sell without
+confirming the actual personal representative.
+
+**Deliberately not wired into the Dealability Score**, same reasoning
+as Phase 6: these are seller-distress/motivation signals for the
+stacked-distress/contact-priority engine a later phase builds, not
+deal-feasibility ones.
+
+**Explicitly not built -- eviction and vacancy.** Duval's Official
+Records has no eviction/landlord-tenant case data at all; that lives in
+a separate court case management system this pipeline does not scrape.
+There is also no free, reliable source to verify whether a property is
+actually vacant. Rather than approximate either from data that doesn't
+support it (e.g. treating "absentee + old building" as a vacancy proxy),
+both are left out entirely and documented as a real gap.
 
 ## Data ownership
 
