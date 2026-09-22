@@ -30,6 +30,9 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
   and thresholds. Edit to retune scoring -- no code changes needed.
 - `config/tax_timeline.json` -- Phase 4 tax-deed timeline thresholds
   (imminent/soon day cutoffs) and closing-runway points per stage.
+- `config/foreclosure_timeline.json` -- Phase 5 foreclosure timeline
+  thresholds (the post-judgment "stale" cutoff) and closing-runway points
+  per stage.
 
 ## Property-type classification (Phase 2)
 
@@ -86,9 +89,10 @@ a tax-related valuation and has not been verified as current market
 value" -- next to the value fields, and the manageable-liens component of
 Dealability counts real, already-scraped active distress documents on the
 property (verified counts, not dollar amounts, which aren't captured).
-"Closing runway" (20 of the 100 points) is a neutral placeholder until
-Phase 4/5 build real tax-deed/foreclosure countdowns -- documented in the
-score's own reasoning text, not hidden.
+"Closing runway" (20 of the 100 points) uses real tax-deed (Phase 4) or
+foreclosure (Phase 5) timeline data when either exists for a property,
+and falls back to a neutral 15-point placeholder otherwise -- documented
+in the score's own reasoning text, not hidden.
 
 ## Tax Deed Timeline (Phase 4)
 
@@ -96,8 +100,8 @@ Every property now also carries a `tax_deed_stage` and
 `days_until_tax_sale`, computed in `compute_tax_deed_timeline()`
 (`duval_leads_db.py`) and config-driven via `config/tax_timeline.json`.
 This replaces the flat "closing runway" placeholder from Phase 3 for
-tax-deed leads specifically -- every other category still uses the
-placeholder pending Phase 5's foreclosure timeline.
+tax-deed leads specifically; foreclosure leads use Phase 5's timeline
+instead (below), and every other category still uses the placeholder.
 
 **What this is built from, and what it isn't:** the *only* real, scraped
 date in this pipeline is the scheduled tax deed auction date from
@@ -140,6 +144,62 @@ rather than approximated from data that doesn't support it. Separately,
 testing -- already handled gracefully by the existing scraper (skips tax
 deed enrichment that run, logs it, and carries forward any previously
 seen tax deed leads from history), not a Phase 4 regression.
+
+## Foreclosure Timeline (Phase 5)
+
+Every property now also carries a `foreclosure_stage` and
+`days_since_foreclosure_milestone`, computed in
+`compute_foreclosure_timeline()` (`duval_leads_db.py`) and config-driven
+via `config/foreclosure_timeline.json`. This feeds the same "closing
+runway" component of the Dealability Score as Phase 4, for leads that
+don't already have a tax-deed timeline (tax-deed wins when a property
+somehow has both, since it's the more precise -- exact date -- signal).
+
+**What this is built from, and what it isn't:** unlike the tax deed
+auction site, Duval's Official Records site never gives an exact sale
+date -- there is no scraped foreclosure-sale-calendar source at all. So
+this is built from two real, verified judicial milestones already
+captured in `documents`: the Lis Pendens filing date (the case's opening
+filing, `cat='foreclosure'`), and, once one exists, the Final Judgment
+date (`doc_type` `RPO FINAL JUDGMENT` or `VA FINAL JUDGMENT`,
+`cat='judgment'` -- deliberately *not* any generic `JUDGMENT`, which is
+far more common and isn't evidence a sale is anywhere close). No exact
+days-until-sale is ever claimed -- only real elapsed time since a real
+recorded milestone, plus Florida Statute 45.031's typical 20-35-day
+post-judgment sale window cited as legal context, not a scraped fact.
+
+Stages:
+
+- `FORECLOSURE_STAGE_FILED` -- a Lis Pendens is on file, no final
+  judgment yet. Case duration varies widely (months to years depending on
+  contested litigation, bankruptcy stays, mediation, etc.), so this is
+  genuinely uncertain -- it scores a moderate 12/20 closing-runway points,
+  not high or low, and the day count shown is informational only, never a
+  countdown.
+- `FORECLOSURE_STAGE_JUDGMENT_ENTERED` -- a final judgment was entered
+  within the last `judgment_recent_days` (default 45). Per FL Statute
+  45.031 the sale is typically scheduled 20-35 days after judgment, so
+  one is likely imminent even without an exact scraped date -- scores a
+  low 4/20 points, same logic as Phase 4's `TAX_STAGE_IMMINENT` (closing
+  runway measures time available to close, not seller motivation).
+- `FORECLOSURE_STAGE_JUDGMENT_STALE` -- a final judgment exists but is
+  older than the statutory window. The outcome (sold, postponed,
+  redeemed, case dismissed) isn't tracked by this pipeline, so this is
+  flagged for manual verification rather than assumed either way, and
+  scores 0 points until confirmed.
+- `FORECLOSURE_STAGE_NONE` -- no Lis Pendens on file for this property
+  (every non-foreclosure lead, and any foreclosure-category lead whose
+  Property Appraiser match failed to resolve a `property_id`). Keeps the
+  same neutral 15/20 placeholder as `TAX_STAGE_NONE`.
+
+**Known gap:** this pipeline has no source for the actual foreclosure
+sale date, sale results, or whether a sale was postponed/cancelled --
+that would require scraping the Duval County Clerk's foreclosure sale
+calendar (a separate system from the Official Records search this
+pipeline already reads), similar in spirit to what Phase 4 did for tax
+deeds. `FORECLOSURE_STAGE_JUDGMENT_STALE` exists specifically to flag
+that gap rather than silently guessing an outcome once the statutory
+window has plausibly passed.
 
 ## Data ownership
 

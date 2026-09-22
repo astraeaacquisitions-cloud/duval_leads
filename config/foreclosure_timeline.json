@@ -1,0 +1,14 @@
+{
+  "_comment": "Phase 5 foreclosure timeline thresholds/points. Unlike Phase 4's tax-deed timeline, there is no scraped foreclosure-sale-calendar source with an exact date, so this is built from two real, verified judicial milestones already in `documents`: the Lis Pendens filing date (cat='foreclosure') and, once one exists, the Final Judgment date (doc_type in RPO/VA FINAL JUDGMENT, cat='judgment'). No exact days-until-sale is ever claimed -- only real elapsed time since a real recorded milestone.",
+
+  "judgment_recent_days": 45,
+  "_judgment_recent_days_comment": "Florida Statute 45.031 requires the clerk to schedule the sale not less than 20 nor more than 35 days after a final judgment of foreclosure -- 45 adds a small buffer for scheduling variance before treating the judgment as 'stale' (statutory window likely passed, outcome unverified).",
+
+  "runway_points": {
+    "_comment": "Out of dealability_weights.json's max_points.closing_runway (20). A fresh Lis Pendens with no judgment yet is genuinely uncertain (case duration varies from months to years) so it scores moderate, not high or low; a recently entered judgment means a sale is likely imminent by statute even without an exact date, so it scores low like Phase 4's TAX_STAGE_IMMINENT.",
+    "filed": 12,
+    "judgment_entered": 4,
+    "judgment_stale": 0,
+    "none": 15
+  }
+}

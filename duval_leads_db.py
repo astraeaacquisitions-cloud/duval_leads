@@ -269,6 +269,8 @@ CREATE TABLE IF NOT EXISTS valuations (
     equity_reasoning TEXT,
     tax_deed_stage TEXT,
     days_until_tax_sale INTEGER,
+    foreclosure_stage TEXT,
+    days_since_foreclosure_milestone INTEGER,
     computed_at TEXT
 );
 
@@ -368,6 +370,8 @@ SCHEMA_MIGRATIONS = [
     ("properties", "building_count", "INTEGER"),
     ("valuations", "tax_deed_stage", "TEXT"),
     ("valuations", "days_until_tax_sale", "INTEGER"),
+    ("valuations", "foreclosure_stage", "TEXT"),
+    ("valuations", "days_since_foreclosure_milestone", "INTEGER"),
 ]
 
 
@@ -823,8 +827,7 @@ def compute_tax_deed_timeline(conn, property_id, config=None, today=None):
     ).fetchone()
     if not row or not row["filed_date"]:
         return "TAX_STAGE_NONE", None, rp.get("none", 15), (
-            "No scheduled tax deed auction on file for this property -- this component stays a "
-            "neutral placeholder (Phase 5 adds the foreclosure timeline for non-tax leads)."
+            "No scheduled tax deed auction on file for this property."
         )
 
     auction_date = _parse_taxdeed_date(row["filed_date"])
@@ -854,11 +857,116 @@ def compute_tax_deed_timeline(conn, property_id, config=None, today=None):
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 5: foreclosure timeline.
+#
+# Unlike Phase 4's tax-deed timeline, there is no scraped foreclosure-sale-
+# calendar source with an exact date -- Duval's Official Records site
+# gives filing dates, not auction dates. So this is built from two real,
+# verified judicial milestones already in `documents`: the Lis Pendens
+# filing date (cat='foreclosure') and, once one exists, the Final
+# Judgment date (doc_type in RPO/VA FINAL JUDGMENT, cat='judgment'). No
+# exact days-until-sale is ever claimed here -- only real elapsed time
+# since a real recorded milestone, with Florida Statute 45.031's typical
+# 20-35-day post-judgment sale window cited as context, not fabricated
+# as a scraped fact.
+# ---------------------------------------------------------------------------
+
+FORECLOSURE_TIMELINE_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "foreclosure_timeline.json"
+)
+
+
+def load_foreclosure_timeline_config(path=FORECLOSURE_TIMELINE_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+FORECLOSURE_TIMELINE_CONFIG = load_foreclosure_timeline_config()
+
+# The two Official Records doc types that are specifically a foreclosure
+# FINAL judgment (as opposed to a generic money JUDGMENT, which is far
+# more common and not evidence a sale is anywhere close) -- see
+# CATEGORY_MAP in the scraper, which stores doc_type as this exact
+# uppercase text regardless of the county API's own casing.
+FORECLOSURE_FINAL_JUDGMENT_TYPES = ("RPO FINAL JUDGMENT", "VA FINAL JUDGMENT")
+
+
+def _parse_iso_date(s):
+    """Parses Official Records' YYYY-MM-DD filed_date (confirmed against
+    real scraped data, as opposed to tax deed's MM-DD-YYYY). Returns a
+    date or None."""
+    if not s:
+        return None
+    try:
+        return datetime.date.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_foreclosure_timeline(conn, property_id, config=None, today=None):
+    """Returns (stage, days, runway_points, reasoning) for one property.
+    `days` is days since the milestone the stage is keyed on (judgment
+    entry if one exists, else the original Lis Pendens filing) -- never a
+    countdown to a sale date this pipeline doesn't have."""
+    config = config if config is not None else FORECLOSURE_TIMELINE_CONFIG
+    today = today or datetime.date.today()
+    rp = config.get("runway_points", {})
+
+    judgment_row = conn.execute(
+        "SELECT filed_date FROM documents WHERE property_id=? AND cat='judgment' AND doc_type IN "
+        f"({','.join('?' for _ in FORECLOSURE_FINAL_JUDGMENT_TYPES)}) "
+        "ORDER BY filed_date DESC LIMIT 1",
+        (property_id, *FORECLOSURE_FINAL_JUDGMENT_TYPES),
+    ).fetchone()
+
+    if judgment_row and judgment_row["filed_date"]:
+        judgment_date = _parse_iso_date(judgment_row["filed_date"])
+        if judgment_date is not None:
+            days_since = (today - judgment_date).days
+            recent_cutoff = config.get("judgment_recent_days", 45)
+            if days_since <= recent_cutoff:
+                when = f"{days_since} day{'s' if days_since != 1 else ''} ago" if days_since >= 0 else "recently"
+                return "FORECLOSURE_STAGE_JUDGMENT_ENTERED", days_since, rp.get("judgment_entered", 4), (
+                    f"Final judgment entered {when} ({judgment_date.isoformat()}) -- Florida law (Stat. 45.031) "
+                    "typically schedules the sale 20-35 days after judgment, so a sale is likely imminent even "
+                    "though this pipeline doesn't scrape the exact sale date; verify it before counting on it."
+                )
+            return "FORECLOSURE_STAGE_JUDGMENT_STALE", days_since, rp.get("judgment_stale", 0), (
+                f"Final judgment was entered {days_since} days ago ({judgment_date.isoformat()}) -- well past the "
+                "typical 20-35 day statutory sale window, so the outcome (sold, postponed, redeemed, dismissed) "
+                "isn't tracked by this pipeline; verify manually before treating this as a live deal."
+            )
+
+    lp_row = conn.execute(
+        "SELECT filed_date FROM documents WHERE property_id=? AND cat='foreclosure' "
+        "ORDER BY filed_date ASC LIMIT 1",
+        (property_id,),
+    ).fetchone()
+    if not lp_row or not lp_row["filed_date"]:
+        return "FORECLOSURE_STAGE_NONE", None, rp.get("none", 15), (
+            "No Lis Pendens on file for this property."
+        )
+    filed_date = _parse_iso_date(lp_row["filed_date"])
+    if filed_date is None:
+        return "FORECLOSURE_STAGE_NONE", None, rp.get("none", 15), (
+            f"Lis Pendens record on file but its filed date ({lp_row['filed_date']!r}) didn't parse -- "
+            "treating as unknown rather than guessing."
+        )
+    days_since_filed = (today - filed_date).days
+    return "FORECLOSURE_STAGE_FILED", days_since_filed, rp.get("filed", 12), (
+        f"Lis Pendens filed {days_since_filed} day{'s' if days_since_filed != 1 else ''} ago "
+        f"({filed_date.isoformat()}) -- no final judgment on file yet; foreclosure case duration varies "
+        "widely (months to years), so this is informational, not a countdown."
+    )
+
+
 def compute_dealability_score(conn, property_id, config=None):
     """Computes the Dealability Score (0-100) for one property from
     what's already in the database -- no network calls. Returns
     (score, reason, equity_signal, equity_confidence, equity_reasoning,
-    active_lien_count, has_tax_distress, tax_deed_stage, days_until_tax_sale)."""
+    active_lien_count, has_tax_distress, tax_deed_stage, days_until_tax_sale,
+    foreclosure_stage, days_since_foreclosure_milestone)."""
     config = config if config is not None else DEALABILITY_CONFIG
     mp = config.get("max_points", {})
     reasons = []
@@ -962,12 +1070,23 @@ def compute_dealability_score(conn, property_id, config=None):
     reasons.append(f"Value reliability: {value_points}/{mp.get('reliable_value_estimate',10)} -- "
                     f"{'PAO market/assessed value on file' if market_value else 'no PAO value found for this property'}.")
 
-    # -- Closing runway: Phase 4 real countdown for tax-deed leads (built
-    # from the scraped auction date, no network call); still a neutral
-    # placeholder for every other lead pending Phase 5's foreclosure
-    # timeline (TAX_STAGE_NONE covers both cases -- no tax-deed document
-    # on file for this property, or that document's date didn't parse).
-    tax_stage, days_until_tax_sale, runway_points, runway_reason = compute_tax_deed_timeline(conn, property_id)
+    # -- Closing runway: real timeline data when it exists, tax-deed first
+    # (Phase 4 -- an exact scraped auction date) then foreclosure (Phase 5
+    # -- real milestones, no exact date), else a neutral placeholder. A
+    # property could in theory carry both a tax-deed and a foreclosure
+    # signal; tax-deed wins because it's the more precise (exact date)
+    # signal of the two.
+    tax_stage, days_until_tax_sale, tax_runway_points, tax_runway_reason = compute_tax_deed_timeline(conn, property_id)
+    foreclosure_stage, days_since_foreclosure_milestone, fc_runway_points, fc_runway_reason = \
+        compute_foreclosure_timeline(conn, property_id)
+    if tax_stage != "TAX_STAGE_NONE":
+        runway_points, runway_reason = tax_runway_points, tax_runway_reason
+    elif foreclosure_stage != "FORECLOSURE_STAGE_NONE":
+        runway_points, runway_reason = fc_runway_points, fc_runway_reason
+    else:
+        runway_points, runway_reason = tax_runway_points, (
+            "No scheduled tax deed auction or Lis Pendens on file for this property -- neutral placeholder."
+        )
     runway_points = min(runway_points, mp.get("closing_runway", 20))
     reasons.append(f"Closing runway: {runway_points}/{mp.get('closing_runway',20)} -- {runway_reason}")
 
@@ -979,7 +1098,7 @@ def compute_dealability_score(conn, property_id, config=None):
     total = max(0, min(100, equity_points + lien_points + owner_points + fits_points + value_points + runway_points))
     reason = " | ".join(reasons)
     return (total, reason, signal, eq_conf, eq_reason, active_lien_count, has_tax_distress,
-            tax_stage, days_until_tax_sale)
+            tax_stage, days_until_tax_sale, foreclosure_stage, days_since_foreclosure_milestone)
 
 
 def compute_dealability_for_all_properties(conn, run_id, config=None):
@@ -997,14 +1116,17 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
     property_ids = [r["id"] for r in conn.execute("SELECT id FROM properties")]
     for property_id in property_ids:
         (score, reason, signal, eq_conf, eq_reason, lien_count, has_tax,
-         tax_stage, days_until_tax_sale) = compute_dealability_score(conn, property_id, config)
+         tax_stage, days_until_tax_sale, foreclosure_stage, days_since_foreclosure_milestone) = \
+            compute_dealability_score(conn, property_id, config)
         conn.execute(
             "UPDATE valuations SET active_lien_count=?, has_tax_distress=?, "
             "equity_signal=?, equity_confidence=?, equity_reasoning=?, "
             "tax_deed_stage=?, days_until_tax_sale=?, "
+            "foreclosure_stage=?, days_since_foreclosure_milestone=?, "
             "value_confidence=?, computed_at=? WHERE property_id=?",
             (lien_count, int(has_tax), signal, eq_conf, eq_reason,
              tax_stage, days_until_tax_sale,
+             foreclosure_stage, days_since_foreclosure_milestone,
              "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN", ts, property_id),
         )
         conn.execute(
@@ -1125,6 +1247,7 @@ def export_csv(conn, path):
         "o.identity_confidence, "
         "v.pao_assessed_value, v.pao_market_value, v.equity_signal, v.equity_confidence, "
         "v.active_lien_count, v.mortgage_estimate, v.tax_deed_stage, v.days_until_tax_sale, "
+        "v.foreclosure_stage, v.days_since_foreclosure_milestone, "
         "(SELECT dealability_score FROM scores s WHERE s.property_id = p.id "
         " ORDER BY computed_at DESC LIMIT 1) AS dealability_score "
         "FROM documents d "
@@ -1140,6 +1263,7 @@ def export_csv(conn, path):
             "Address Match Confidence", "Property Type", "Property Type Decision", "Year Built",
             "PAO Assessed Value", "PAO Market Value", "Equity Signal", "Equity Confidence",
             "Active Lien Count", "Mortgage Estimate", "Tax Deed Stage", "Days Until Tax Sale",
+            "Foreclosure Stage", "Days Since Foreclosure Milestone",
             "Dealability Score",
             "Suppressed", "Category", "Document Type", "Filed Date",
             "Document Number", "Amount", "Legal Description", "Flags", "Legacy Score", "Source",
@@ -1164,6 +1288,8 @@ def export_csv(conn, path):
                 r["mortgage_estimate"] or "UNKNOWN",
                 r["tax_deed_stage"] or "TAX_STAGE_NONE",
                 r["days_until_tax_sale"] if r["days_until_tax_sale"] is not None else "",
+                r["foreclosure_stage"] or "FORECLOSURE_STAGE_NONE",
+                r["days_since_foreclosure_milestone"] if r["days_since_foreclosure_milestone"] is not None else "",
                 r["dealability_score"] if r["dealability_score"] is not None else "",
                 "yes" if r["property_id"] in suppressed_props else "no",
                 r["cat"] or "", r["doc_type"] or "", r["filed_date"] or "", r["doc_num"] or "",

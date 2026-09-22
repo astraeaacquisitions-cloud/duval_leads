@@ -548,6 +548,8 @@ function computeCompoundGroups(records){
       dealability_reason: (distress.find(g=>g.dealability_reason)||{}).dealability_reason || "",
       tax_deed_stage: (distress.find(g=>g.tax_deed_stage && g.tax_deed_stage!=="TAX_STAGE_NONE")||{}).tax_deed_stage || "TAX_STAGE_NONE",
       days_until_tax_sale: (distress.find(g=>g.days_until_tax_sale!=null)||{}).days_until_tax_sale ?? null,
+      foreclosure_stage: (distress.find(g=>g.foreclosure_stage && g.foreclosure_stage!=="FORECLOSURE_STAGE_NONE")||{}).foreclosure_stage || "FORECLOSURE_STAGE_NONE",
+      days_since_foreclosure_milestone: (distress.find(g=>g.days_since_foreclosure_milestone!=null)||{}).days_since_foreclosure_milestone ?? null,
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -782,7 +784,7 @@ function renderFilingsRows(){
     const suppressed = isSuppressed(r.property_id);
     return `<tr data-idx="${start+i}"${suppressed?' class="is-suppressed"':''}>
       <td><div class="seal ${sealClass(sc)}">${sc}</div></td>
-      <td><span class="tab ${catClass(r.cat)}">${r.cat_label||r.doc_type||"–"}</span>${taxCountdownBadgeHtml(r)}${suppressed?'<span class="badge-suppressed">Suppressed</span>':''}</td>
+      <td><span class="tab ${catClass(r.cat)}">${r.cat_label||r.doc_type||"–"}</span>${timelineCountdownBadgeHtml(r)}${suppressed?'<span class="badge-suppressed">Suppressed</span>':''}</td>
       <td class="mono">${r.doc_num||"–"}</td>
       <td class="mono">${r.filed||"–"}</td>
       <td class="owner-cell">${r.owner||"–"}${r.grantee?`<div class="sub">${r.grantee}</div>`:""}</td>
@@ -818,7 +820,7 @@ function renderCompoundRows(){
     return `<tr data-idx="${start+i}"${suppressed?' class="is-suppressed"':''}>
       <td><div class="tier-badge tier-${g.tier}">${g.tier}</div>${suppressed?'<span class="badge-suppressed">Suppr.</span>':''}</td>
       <td class="addr-cell">${addr}</td>
-      <td><div class="cat-chip-row">${g.cats.map(c=>`<span class="tab ${catClass(c)}">${c.replace('_',' ')}</span>`).join("")}${taxCountdownBadgeHtml(g)}</div></td>
+      <td><div class="cat-chip-row">${g.cats.map(c=>`<span class="tab ${catClass(c)}">${c.replace('_',' ')}</span>`).join("")}${timelineCountdownBadgeHtml(g)}</div></td>
       <td class="mono">${g.filing_count}</td>
       <td><div class="seal ${sealClass(g.max_score)}">${g.max_score}</div></td>
       <td class="owner-cell">${g.owner||"–"}</td>
@@ -945,6 +947,53 @@ function taxDeedTimelineHtml(r){
   `;
 }
 
+const FORECLOSURE_STAGE_META = {
+  FORECLOSURE_STAGE_FILED:            {color:"var(--warn)",   label:"Lis Pendens Filed"},
+  FORECLOSURE_STAGE_JUDGMENT_ENTERED: {color:"var(--crit)",   label:"Judgment Entered"},
+  FORECLOSURE_STAGE_JUDGMENT_STALE:   {color:"var(--purple)", label:"Judgment -- unverified"},
+};
+
+// Phase 5: foreclosure timeline. Unlike the tax-deed timeline, there's no
+// scraped sale-calendar source with an exact date, so this is built from
+// two real, verified judicial milestones: the Lis Pendens filing date, and
+// (once one exists) the Final Judgment date. No exact days-until-sale is
+// ever shown -- only real elapsed time since a real milestone, with
+// Florida's typical 20-35-day post-judgment sale window cited as context.
+function foreclosureTimelineHtml(r){
+  const stage = r.foreclosure_stage || "FORECLOSURE_STAGE_NONE";
+  if(stage === "FORECLOSURE_STAGE_NONE") return "";
+  const meta = FORECLOSURE_STAGE_META[stage] || {color:"var(--muted)", label:stage};
+  const days = r.days_since_foreclosure_milestone;
+  const elapsed = days==null ? "– unknown –" : `${Math.abs(days)} day${Math.abs(days)===1?"":"s"} ago`;
+  const milestoneLabel = stage === "FORECLOSURE_STAGE_FILED" ? "Lis Pendens filed" : "Final judgment entered";
+  return `
+    <div class="msection"><h4>Foreclosure Timeline</h4>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="equity-signal" style="border-color:${meta.color};color:${meta.color}">${meta.label}</span>
+        <span style="font-size:12.5px">${milestoneLabel}${days!=null?` ${elapsed}`:" -- date unknown"}</span>
+      </div>
+      ${stage==="FORECLOSURE_STAGE_FILED"?`<div style="font-size:11px;color:var(--muted2);margin-top:8px">No final judgment on file yet -- case duration varies widely (months to years); this is informational, not a countdown.</div>`:""}
+      ${stage==="FORECLOSURE_STAGE_JUDGMENT_ENTERED"?`<div style="font-size:11px;color:var(--muted2);margin-top:8px">Florida law (Stat. 45.031) typically schedules the sale 20-35 days after judgment -- a sale is likely imminent even though the exact date isn't scraped; verify it before counting on it.</div>`:""}
+      ${stage==="FORECLOSURE_STAGE_JUDGMENT_STALE"?`<div class="value-warning" style="margin-top:8px">Well past the typical 20-35 day statutory sale window -- outcome (sold, postponed, redeemed, dismissed) is not tracked by this pipeline. Verify manually before treating this as a live deal.</div>`:""}
+    </div>
+  `;
+}
+
+// Compact inline badge for the table row -- tax-deed takes precedence
+// over foreclosure when a property somehow carries both (matches the
+// backend's closing-runway precedence), and "no timeline" / far-out tax
+// stages aren't worth the row noise.
+function timelineCountdownBadgeHtml(r){
+  const taxBadge = taxCountdownBadgeHtml(r);
+  if(taxBadge) return taxBadge;
+  const stage = r.foreclosure_stage;
+  if(!stage || stage==="FORECLOSURE_STAGE_NONE" || stage==="FORECLOSURE_STAGE_FILED") return "";
+  const meta = FORECLOSURE_STAGE_META[stage] || {color:"var(--muted)", label:stage};
+  const days = r.days_since_foreclosure_milestone;
+  const text = days==null ? meta.label : `${days}d`;
+  return `<span class="equity-signal" style="border-color:${meta.color};color:${meta.color};margin-left:6px" title="Foreclosure -- ${meta.label}">⚖ ${text}</span>`;
+}
+
 function reviewBadgesHtml(flags){
   flags = flags || [];
   const badges = [];
@@ -983,6 +1032,7 @@ function openModal(r){
     </div>
     ${valuationDealabilityHtml(r)}
     ${taxDeedTimelineHtml(r)}
+    ${foreclosureTimelineHtml(r)}
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(r.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
     </div>
@@ -1030,6 +1080,7 @@ function openCompoundModal(g){
     </div>
     ${valuationDealabilityHtml(g)}
     ${taxDeedTimelineHtml(g)}
+    ${foreclosureTimelineHtml(g)}
     <div class="msection"><h4>All Filings At This Address</h4>
       <ul class="filing-list">${filingsHtml}</ul>
     </div>
