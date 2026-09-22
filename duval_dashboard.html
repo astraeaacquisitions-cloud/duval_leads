@@ -395,7 +395,11 @@ tbody tr.is-suppressed{opacity:.45}
       <option value="15">15+ yrs owned</option>
       <option value="20">20+ yrs owned</option>
     </select>
+    <select id="ptype-filter" title="Florida DOR property use classification. Populated from what's actually in the data.">
+      <option value="">All Property Types</option>
+    </select>
     <button class="chip" id="addr-filter">Has Address</button>
+    <button class="chip" id="review-filter" title="TRUST_OWNERSHIP_REVIEW_REQUIRED or PROPERTY_TYPE_REVIEW_REQUIRED">Review Required Only</button>
     <button class="chip active" id="suppressed-filter">Hide Suppressed</button>
     <div class="spacer"></div>
     <button class="btn-primary" id="export-csv-btn">⇩ Export CSV</button>
@@ -517,6 +521,7 @@ function computeCompoundGroups(records){
       owner: owners.join(" / "),
       years_owned: yearsOwned >= 0 ? yearsOwned : null,
       market_value: (distress.find(g=>g.market_value)||{}).market_value ?? null,
+      property_type_label: (distress.find(g=>g.property_type_label)||{}).property_type_label || "",
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -545,6 +550,7 @@ async function loadData(){
 
     buildStats(ALL_RECORDS);
     buildCharts(ALL_RECORDS);
+    populatePtypeFilter(ALL_RECORDS);
     renderTableHead();
     applyFilters();
   }catch(e){
@@ -566,6 +572,15 @@ function buildStats(recs){
   document.getElementById("s-avg").textContent   = avg;
   document.getElementById("s-fc").textContent    = fc.toLocaleString();
   document.getElementById("s-lien").textContent  = lien.toLocaleString();
+}
+
+function populatePtypeFilter(recs){
+  const sel = document.getElementById("ptype-filter");
+  const current = sel.value;
+  const labels = [...new Set(recs.map(r=>r.property_type_label).filter(Boolean))].sort();
+  sel.innerHTML = `<option value="">All Property Types</option>` +
+    labels.map(l=>`<option value="${l}">${l}</option>`).join("");
+  if(labels.includes(current)) sel.value = current;
 }
 
 function buildCharts(recs){
@@ -601,12 +616,19 @@ function isSuppressed(propertyId){
   return !!(s && s.suppressed);
 }
 
+const REVIEW_FLAGS = ["TRUST_OWNERSHIP_REVIEW_REQUIRED", "PROPERTY_TYPE_REVIEW_REQUIRED"];
+function isReviewRequired(flags){
+  return (flags||[]).some(f=>REVIEW_FLAGS.includes(f));
+}
+
 function applyFilters(){
   const q   = document.getElementById("search-input").value.toLowerCase();
   const cat = document.getElementById("cat-filter").value;
   const minS = parseInt(document.getElementById("score-filter").value) || 0;
   const minYears = parseInt(document.getElementById("years-filter").value) || 0;
+  const ptype = document.getElementById("ptype-filter").value;
   const addrOnly = document.getElementById("addr-filter").classList.contains("active");
+  const reviewOnly = document.getElementById("review-filter").classList.contains("active");
   const hideSuppressed = document.getElementById("suppressed-filter").classList.contains("active");
 
   if(viewMode === "compound"){
@@ -615,6 +637,8 @@ function applyFilters(){
       if(cat && !g.cats.includes(cat)) return false;
       if(g.max_score < minS) return false;
       if(minYears && (g.years_owned==null || g.years_owned < minYears)) return false;
+      if(ptype && g.property_type_label !== ptype) return false;
+      if(reviewOnly && !isReviewRequired(g.flags)) return false;
       if(q){
         const hay = [g.owner,g.address,g.prop_city,g.prop_zip,g.catLabels.join(" "),g.flags.join(" ")].join(" ").toLowerCase();
         if(!hay.includes(q)) return false;
@@ -632,6 +656,8 @@ function applyFilters(){
       if(cat && r.cat !== cat) return false;
       if(r.score < minS) return false;
       if(minYears && (r.years_owned==null || r.years_owned < minYears)) return false;
+      if(ptype && r.property_type_label !== ptype) return false;
+      if(reviewOnly && !isReviewRequired(r.flags)) return false;
       if(addrOnly && !r.prop_address) return false;
       if(q){
         const hay = [r.owner,r.doc_num,r.prop_address,r.prop_city,r.prop_zip,r.grantee,r.legal,r.cat_label].join(" ").toLowerCase();
@@ -807,6 +833,18 @@ function confidenceLabel(c){
     name_only_unmerged:"Unconfirmed identity", unmatched:"Unmatched"}[c] || c || "Unknown";
 }
 
+function reviewBadgesHtml(flags){
+  flags = flags || [];
+  const badges = [];
+  if(flags.includes("TRUST_OWNERSHIP_REVIEW_REQUIRED"))
+    badges.push(`<span class="badge-trust">⚑ Trust ownership -- verify trustee authority before contact</span>`);
+  if(flags.includes("PROPERTY_TYPE_REVIEW_REQUIRED"))
+    badges.push(`<span class="badge-trust">⚑ Property type needs confirmation before contact</span>`);
+  if(flags.includes("TEARDOWN_INFILL_CANDIDATE"))
+    badges.push(`<span class="badge-confidence">⚑ Possible teardown/infill candidate</span>`);
+  return badges.length ? `<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">${badges.join("")}</div>` : "";
+}
+
 function openModal(r){
   const sc = r.score||0;
   document.getElementById("modal-content").innerHTML = `
@@ -819,6 +857,7 @@ function openModal(r){
       <div class="ditem"><label>Amount</label><div class="v mono">${fmt$(r.amount)}</div></div>
       <div class="ditem"><label>Other Party</label><div class="v">${r.grantee||"–"}</div></div>
       <div class="ditem"><label>Source</label><div class="v">${r.source||"–"}</div></div>
+      <div class="ditem"><label>Property Type</label><div class="v">${r.property_type_label||"– unknown –"}${r.year_built?` (built ${r.year_built})`:""}</div></div>
     </div>
     ${r.legal?`<div class="ditem" style="margin-bottom:14px"><label>Legal Description</label><div class="v" style="font-size:11.5px;color:var(--muted2)">${r.legal}</div></div>`:""}
     <div class="msection"><h4>Property Address</h4>
@@ -843,7 +882,7 @@ function openModal(r){
         <div class="ditem"><label>Address Confidence</label><div class="v"><span class="badge-confidence">${confidenceLabel(r.address_match_confidence)}</span></div></div>
         <div class="ditem"><label>Owner Identity Confidence</label><div class="v"><span class="badge-confidence">${confidenceLabel(r.owner_identity_confidence)}</span></div></div>
       </div>
-      ${(r.flags||[]).includes("TRUST_OWNERSHIP_REVIEW_REQUIRED")?`<div style="margin-top:8px"><span class="badge-trust">⚑ Trust ownership -- verify trustee authority before contact</span></div>`:""}
+      ${reviewBadgesHtml(r.flags)}
     </div>
     ${renderLeadMgmtHtml(r.property_id)}
   `;
@@ -880,7 +919,7 @@ function openCompoundModal(g){
     </div>
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(g.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
-      ${(g.flags||[]).includes("TRUST_OWNERSHIP_REVIEW_REQUIRED")?`<div style="margin-top:8px"><span class="badge-trust">⚑ Trust ownership -- verify trustee authority before contact</span></div>`:""}
+      ${reviewBadgesHtml(g.flags)}
     </div>
     <div class="msection"><h4>Identity</h4>
       <div class="ditem"><label>Property ID</label><div class="v mono" style="font-size:11px">${g.property_id||"– unmatched –"}</div></div>
@@ -1014,7 +1053,9 @@ document.getElementById("search-input").addEventListener("input", debounce(apply
 document.getElementById("cat-filter").addEventListener("change", applyFilters);
 document.getElementById("score-filter").addEventListener("change", applyFilters);
 document.getElementById("years-filter").addEventListener("change", applyFilters);
+document.getElementById("ptype-filter").addEventListener("change", applyFilters);
 document.getElementById("addr-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });
+document.getElementById("review-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });
 document.getElementById("suppressed-filter").addEventListener("click", function(){ this.classList.toggle("active"); applyFilters(); });
 
 let downloadsCap = null;

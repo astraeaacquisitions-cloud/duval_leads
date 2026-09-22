@@ -79,7 +79,18 @@ CREATE TABLE IF NOT EXISTS properties (
     address_match_confidence TEXT,
     first_seen_at TEXT,
     last_seen_at TEXT,
-    merged_into_id TEXT
+    merged_into_id TEXT,
+    -- Phase 2: Florida DOR property use classification (see
+    -- classify_property_type() in duval_leads_scraper.py). decision is
+    -- 'include' | 'review' | 'exclude'; excluded records never reach this
+    -- table at all (filtered in build_records()'s keep()), so any row
+    -- seen here is 'include' or 'review' by construction, or NULL for
+    -- records predating this feature.
+    property_use_code TEXT,
+    property_type_label TEXT,
+    property_type_decision TEXT,
+    year_built INTEGER,
+    building_count INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS owners (
@@ -285,12 +296,39 @@ def owner_identity(display_name, mailing_address, mailing_city, mailing_zip, pro
     return _hash_id("own", display_name, "DOC", doc_id), "name_only_unmerged"
 
 
+# Columns added to a table AFTER its original CREATE TABLE. "CREATE TABLE
+# IF NOT EXISTS" is a no-op on a table that already exists -- it does NOT
+# add new columns -- so a database file created before one of these was
+# added would otherwise crash the first time a query touches it, on any
+# container whose disk survives a schema change between runs. Append here
+# whenever a future phase adds a column to an existing table; each entry
+# is (table, column, "TYPE [DEFAULT ...]") exactly as it would appear in
+# CREATE TABLE, applied via ALTER TABLE ... ADD COLUMN, guarded by
+# checking PRAGMA table_info first so this is safe to run every startup.
+SCHEMA_MIGRATIONS = [
+    ("properties", "property_use_code", "TEXT"),
+    ("properties", "property_type_label", "TEXT"),
+    ("properties", "property_type_decision", "TEXT"),
+    ("properties", "year_built", "INTEGER"),
+    ("properties", "building_count", "INTEGER"),
+]
+
+
+def _migrate_schema(conn):
+    for table, column, type_decl in SCHEMA_MIGRATIONS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+    conn.commit()
+
+
 def init_db(path):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate_schema(conn)
     return conn
 
 
@@ -367,7 +405,9 @@ def _doc_id(source, doc_num, doc_type):
     return _hash_id("doc", source, doc_num, doc_type)
 
 
-def _upsert_property(conn, ts, re_number, situs_address, situs_city, situs_state, situs_zip):
+def _upsert_property(conn, ts, re_number, situs_address, situs_city, situs_state, situs_zip,
+                      property_use_code="", property_type_label="", property_type_decision="",
+                      year_built=None, building_count=None):
     prop_id, confidence = property_identity(re_number, situs_address, situs_city, situs_zip)
     if not prop_id:
         return None, "unmatched"
@@ -379,15 +419,24 @@ def _upsert_property(conn, ts, re_number, situs_address, situs_city, situs_state
             "situs_city=COALESCE(NULLIF(?,''), situs_city), "
             "situs_state=COALESCE(NULLIF(?,''), situs_state), "
             "situs_zip=COALESCE(NULLIF(?,''), situs_zip), "
-            "address_match_confidence=?, last_seen_at=? WHERE id=?",
-            (re_number, situs_address, situs_city, situs_state, situs_zip, confidence, ts, prop_id),
+            "address_match_confidence=?, last_seen_at=?, "
+            "property_use_code=COALESCE(NULLIF(?,''), property_use_code), "
+            "property_type_label=COALESCE(NULLIF(?,''), property_type_label), "
+            "property_type_decision=COALESCE(NULLIF(?,''), property_type_decision), "
+            "year_built=COALESCE(?, year_built), building_count=COALESCE(?, building_count) "
+            "WHERE id=?",
+            (re_number, situs_address, situs_city, situs_state, situs_zip, confidence, ts,
+             property_use_code, property_type_label, property_type_decision,
+             year_built, building_count, prop_id),
         )
     else:
         conn.execute(
             "INSERT INTO properties (id, re_number, situs_address, situs_city, situs_state, "
-            "situs_zip, address_match_confidence, first_seen_at, last_seen_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (prop_id, re_number, situs_address, situs_city, situs_state, situs_zip, confidence, ts, ts),
+            "situs_zip, address_match_confidence, first_seen_at, last_seen_at, "
+            "property_use_code, property_type_label, property_type_decision, year_built, building_count) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (prop_id, re_number, situs_address, situs_city, situs_state, situs_zip, confidence, ts, ts,
+             property_use_code, property_type_label, property_type_decision, year_built, building_count),
         )
     return prop_id, confidence
 
@@ -453,6 +502,8 @@ def persist_records(conn, records, run_id, source_note=""):
         prop_id, prop_conf = _upsert_property(
             conn, ts, r.get("re_number", ""), r.get("prop_address", ""),
             r.get("prop_city", ""), r.get("prop_state", ""), r.get("prop_zip", ""),
+            r.get("property_use_code", ""), r.get("property_type_label", ""),
+            r.get("property_type_decision", ""), r.get("year_built"), r.get("building_count"),
         )
         owner_id, owner_conf = _upsert_owner(
             conn, ts, r.get("owner", ""), r.get("mail_address", ""), r.get("mail_city", ""),
@@ -511,6 +562,15 @@ def persist_records(conn, records, run_id, source_note=""):
                 conn, "verify_trust_authority", property_id=prop_id, owner_id=owner_id,
                 description=f"TRUST_OWNERSHIP_REVIEW_REQUIRED: confirm trustee identity and authority "
                              f"to sell for {owner_name!r} before treating any contact as decision-maker.",
+                priority="normal",
+            )
+
+        if r.get("property_type_decision") == "review" and prop_id:
+            _add_research_task_if_absent(
+                conn, "confirm_property_type", property_id=prop_id,
+                description=f"PROPERTY_TYPE_REVIEW_REQUIRED: {r.get('property_type_label', 'ambiguous type')} "
+                             f"(DOR code {r.get('property_use_code', '?')}) -- confirm this fits acquisition "
+                             f"criteria before spending more time on it.",
                 priority="normal",
             )
 
@@ -635,6 +695,7 @@ def export_csv(conn, path):
     rows = conn.execute(
         "SELECT d.*, p.re_number, p.situs_address, p.situs_city, p.situs_state, p.situs_zip, "
         "p.address_match_confidence, p.first_seen_at AS property_first_seen, "
+        "p.property_type_label, p.property_type_decision, p.year_built, "
         "o.display_name, o.mailing_address, o.mailing_city, o.mailing_state, o.mailing_zip, "
         "o.identity_confidence "
         "FROM documents d "
@@ -646,7 +707,8 @@ def export_csv(conn, path):
     cols = ["property_id", "owner_id", "First Name", "Last Name", "Owner Display Name",
             "Mailing Address", "Mailing City", "Mailing State", "Mailing Zip", "Owner Identity Confidence",
             "Property RE#", "Property Address", "Property City", "Property State", "Property Zip",
-            "Address Match Confidence", "Suppressed", "Category", "Document Type", "Filed Date",
+            "Address Match Confidence", "Property Type", "Property Type Decision", "Year Built",
+            "Suppressed", "Category", "Document Type", "Filed Date",
             "Document Number", "Amount", "Legal Description", "Flags", "Legacy Score", "Source",
             "First Seen", "Last Seen"]
 
@@ -662,6 +724,7 @@ def export_csv(conn, path):
                 r["mailing_zip"] or "", r["identity_confidence"] or "",
                 r["re_number"] or "", r["situs_address"] or "", r["situs_city"] or "",
                 r["situs_state"] or "", r["situs_zip"] or "", r["address_match_confidence"] or "",
+                r["property_type_label"] or "", r["property_type_decision"] or "", r["year_built"] or "",
                 "yes" if r["property_id"] in suppressed_props else "no",
                 r["cat"] or "", r["doc_type"] or "", r["filed_date"] or "", r["doc_num"] or "",
                 r["amount"] or "", r["legal_desc"] or "",

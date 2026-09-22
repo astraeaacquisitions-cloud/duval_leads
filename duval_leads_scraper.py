@@ -335,6 +335,77 @@ def is_trust_owned(owner_name):
 def is_unit_address(addr):
     return bool(re.search(r"\bUNIT\b", addr or "", re.I))
 
+
+# ---------------------------------------------------------------------------
+# Property-type classification (Phase 2 acquisition criteria)
+# ---------------------------------------------------------------------------
+
+PROPERTY_TYPE_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "property_type_rules.json"
+)
+
+
+def load_property_type_config(path=PROPERTY_TYPE_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+PROPERTY_TYPE_CONFIG = load_property_type_config()
+
+
+def classify_property_type(property_use_code, config=None):
+    """Classifies a 4-digit Florida DOR Property Use code (e.g. "0100" for
+    Single Family) into ('include' | 'review' | 'exclude', label), driven
+    entirely by config/property_type_rules.json -- edit that file to
+    change what's in/out/flagged, no code change needed. An unrecognized
+    prefix defaults to 'review', never silently excluded or included: a
+    genuinely new/rare code should get a human look, not vanish or get
+    waved through."""
+    config = config if config is not None else PROPERTY_TYPE_CONFIG
+    prefix = (property_use_code or "")[:2]
+    label = config.get("labels", {}).get(prefix, prefix or "Unknown")
+    if not prefix:
+        return config.get("default_decision", "review"), "Unknown"
+
+    decisions = config.get("decisions", {})
+    if prefix in decisions:
+        return decisions[prefix], label
+
+    try:
+        n = int(prefix)
+    except ValueError:
+        return config.get("default_decision", "review"), label
+    for lo, hi in config.get("exclude_ranges", []):
+        if lo <= n <= hi:
+            return "exclude", label
+    return config.get("default_decision", "review"), label
+
+
+def property_type_excluded(record, include_all_property_types=False):
+    """Standalone, testable version of the property-type check used in
+    build_records()'s exclusion filter -- true only for records already
+    classified 'exclude' by classify_property_type(). Missing/None
+    decisions (records predating Phase 2) are never excluded by this."""
+    if include_all_property_types:
+        return False
+    return record.get("property_type_decision") == "exclude"
+
+
+def is_teardown_infill_candidate(property_use_code, year_built, building_count, config=None):
+    """A signal flag, not a score -- see TEARDOWN_INFILL_CANDIDATE. Vacant
+    residential land, or a single old structure, are the simple heuristics;
+    this makes no claim about condition or actual redevelopment feasibility."""
+    config = config if config is not None else PROPERTY_TYPE_CONFIG
+    td = config.get("teardown_infill", {})
+    prefix = (property_use_code or "")[:2]
+    if prefix in td.get("vacant_prefixes", ["00"]):
+        return True
+    threshold = td.get("old_building_year_threshold", 1960)
+    if year_built and (building_count or 0) <= 1 and year_built < threshold:
+        return True
+    return False
+
+
 # Duval's Official Records has no distinct "Code Violation" doc type --
 # code enforcement liens are just filed as generic LIEN. The only way to
 # separate them out is by WHO filed the lien: if the filer (the "grantee"
@@ -512,6 +583,34 @@ def get_detail(session, re_raw):
                 except ValueError:
                     pass
 
+    # Property Use is the Florida DOR use code for the parcel as a whole
+    # (e.g. "0100 Single Family") -- the authoritative field for
+    # residential/apartment/commercial classification, and it's on this
+    # same page already fetched for market value/sales history, so this
+    # costs no extra request. See classify_property_type().
+    property_use_code, property_use_label = "", ""
+    use_str = text("ctl00_cphBody_lblPropertyUse")
+    use_m = re.match(r"^\s*(\d{4})\s+(.*)$", use_str)
+    if use_m:
+        property_use_code, property_use_label = use_m.group(1), use_m.group(2).strip()
+    elif use_str:
+        property_use_label = use_str
+
+    # Buildings are a repeater (ctl00, ctl01, ...); zero matches is itself
+    # a signal (vacant land). Take the first building's type/year as the
+    # primary structure -- same "most recent/primary row" convention as
+    # last_sale_date/last_sale_price above.
+    building_type_els = soup.find_all(id=re.compile(r"^ctl00_cphBody_repeaterBuilding_ctl\d+_lblBuildingType$"))
+    year_built_els = soup.find_all(id=re.compile(r"^ctl00_cphBody_repeaterBuilding_ctl\d+_lblYearBuilt$"))
+    building_count = len(building_type_els)
+    building_type = building_type_els[0].get_text(strip=True) if building_type_els else ""
+    year_built = None
+    if year_built_els:
+        try:
+            year_built = int(year_built_els[0].get_text(strip=True))
+        except ValueError:
+            pass
+
     return {
         "subdivision": subdivision,
         "mailing_name": mailing_name,
@@ -520,6 +619,11 @@ def get_detail(session, re_raw):
         "market_value": market_value,
         "last_sale_date": last_sale_date,
         "last_sale_price": last_sale_price,
+        "property_use_code": property_use_code,
+        "property_use_label": property_use_label,
+        "building_count": building_count,
+        "building_type": building_type,
+        "year_built": year_built,
     }
 
 
@@ -628,7 +732,8 @@ def compute_score_flags(cat, filed_date, owner_name, prop_address, mail_address,
 # ---------------------------------------------------------------------------
 
 
-def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=None):
+def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=None,
+                   include_all_property_types=False):
     """history maps doc_num -> a previously-built record (loaded from a prior
     run's output). A doc_num already in history is reused as-is instead of
     re-enriched (the filing itself is immutable once recorded, and this
@@ -647,6 +752,7 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
             not zip_excluded(record["prop_zip"])
             and not is_entity_owned(record["owner"])
             and not is_unit_address(record["prop_address"])
+            and not property_type_excluded(record, include_all_property_types)
         )
 
     def take(doc_num, record):
@@ -716,6 +822,12 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
             except (ValueError, TypeError):
                 pass
 
+        property_type_decision, property_type_label = classify_property_type(match.get("property_use_code", ""))
+        if property_type_decision == "review":
+            flags.append("PROPERTY_TYPE_REVIEW_REQUIRED")
+        if is_teardown_infill_candidate(match.get("property_use_code", ""), match.get("year_built"), match.get("building_count")):
+            flags.append("TEARDOWN_INFILL_CANDIDATE")
+
         record = {
             "doc_num": doc_num,
             "doc_type": r.get("DocTypeDescription", ""),
@@ -736,6 +848,11 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
             "mail_zip": mail_zip,
             "clerk_url": "https://or.duvalclerk.com/search/SearchTypeInstrumentNumber",
             "re_number": match.get("re_number", "") or match.get("re_raw", ""),
+            "property_use_code": match.get("property_use_code", ""),
+            "property_type_label": property_type_label,
+            "property_type_decision": property_type_decision,
+            "year_built": match.get("year_built"),
+            "building_count": match.get("building_count"),
             "flags": flags,
             "score": score,
             "source": "Duval County Clerk -- Official Records",
@@ -793,6 +910,12 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
                 except (ValueError, TypeError):
                     pass
 
+            property_type_decision, property_type_label = classify_property_type(detail.get("property_use_code", ""))
+            if property_type_decision == "review":
+                flags.append("PROPERTY_TYPE_REVIEW_REQUIRED")
+            if is_teardown_infill_candidate(detail.get("property_use_code", ""), detail.get("year_built"), detail.get("building_count")):
+                flags.append("TEARDOWN_INFILL_CANDIDATE")
+
             record = {
                 "doc_num": doc_num,
                 "doc_type": "TAX DEED",
@@ -813,6 +936,11 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
                 "mail_zip": mail_zip,
                 "clerk_url": item["parcel_appraiser_url"],
                 "re_number": item["parcel_id"],
+                "property_use_code": detail.get("property_use_code", ""),
+                "property_type_label": property_type_label,
+                "property_type_decision": property_type_decision,
+                "year_built": detail.get("year_built"),
+                "building_count": detail.get("building_count"),
                 "flags": flags,
                 "score": score,
                 "source": "Duval County Tax Deed Auction",
@@ -880,6 +1008,10 @@ def main():
                          help="Full-fidelity export of the SQLite layer, git-tracked for durability")
     parser.add_argument("--csv", default="data/export_leads.csv")
     parser.add_argument("--hubspot-csv", default="data/hubspot_export.csv")
+    parser.add_argument("--include-all-property-types", action="store_true",
+                         help="Disable the Phase 2 apartment/commercial exclusion filter entirely "
+                              "(the \"manually enable\" escape hatch -- normally edit "
+                              "config/property_type_rules.json instead, which is reversible per-category)")
     parser.add_argument("--skip-db", action="store_true",
                          help="Scrape and write records.json only, skip the SQLite layer (debugging escape hatch)")
     args = parser.parse_args()
@@ -904,7 +1036,8 @@ def main():
     # already assembles it. Nothing below this point changes that list's
     # membership or the doc_num-keyed history mechanism; the SQLite layer
     # only reads it and adds identity/confidence fields on top.
-    records = build_records(args.days, args.records_delay, args.pao_delay, args.max_detail_scan, history=history)
+    records = build_records(args.days, args.records_delay, args.pao_delay, args.max_detail_scan,
+                             history=history, include_all_property_types=args.include_all_property_types)
 
     conn = None
     if not args.skip_db:

@@ -20,6 +20,35 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
   imports `records.json` (or a `backup.json` export) into the SQLite
   layer. Always point `--db` at a throwaway path first to verify an
   import before running it against the real database.
+- `config/property_type_rules.json` -- Phase 2 acquisition criteria: which
+  Florida DOR Property Use codes are included, excluded, or flagged for
+  review. Edit this file to change what the pipeline targets -- no code
+  changes needed. This is the "manually enable" mechanism for apartments/
+  commercial. `--include-all-property-types` on the scraper is a blunter,
+  temporary override that disables the filter entirely.
+
+## Property-type classification (Phase 2)
+
+Every record now carries `property_use_code`/`property_type_label` (the
+Florida DOR use code straight from the Property Appraiser detail page --
+e.g. `0100` / "Single Family"), `year_built`, and `building_count`.
+Classification (`classify_property_type()` in `duval_leads_scraper.py`,
+driven by `config/property_type_rules.json`) sorts every property into:
+
+- **include** -- single family, vacant residential. These are never filtered out.
+- **review** -- mobile homes, small multi-family, condos, co-ops, retirement
+  homes, and any unrecognized code. Kept in the data, flagged
+  `PROPERTY_TYPE_REVIEW_REQUIRED`, never silently included or excluded.
+- **exclude** -- apartments (10+ units) and commercial/industrial/
+  agricultural/institutional/government parcels. Filtered out of
+  `records.json` by default, same as the existing ZIP/entity/unit-address
+  exclusions -- reversible by editing the config file, or by rerunning
+  with `--include-all-property-types`.
+
+`TEARDOWN_INFILL_CANDIDATE` is a separate, informational flag (vacant
+residential land, or a single structure built before 1960) -- a signal to
+look at, not a score change and not a claim about actual condition or
+redevelopment feasibility.
 
 ## Data ownership
 

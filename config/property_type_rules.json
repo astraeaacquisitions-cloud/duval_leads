@@ -1,0 +1,53 @@
+{
+  "_comment": "Phase 2 acquisition criteria: which Florida DOR Property Use codes to include, exclude, or flag for review. Edit this file to change behavior -- no code changes needed. 'decisions' keys are the first 2 digits of the DOR code (e.g. property use '0100' -> prefix '01'). Any prefix not listed here and not covered by exclude_ranges defaults to 'default_decision' (review) -- an unrecognized code is never silently excluded OR silently included.",
+
+  "decisions": {
+    "00": "include",
+    "01": "include",
+    "02": "review",
+    "03": "review",
+    "04": "review",
+    "05": "review",
+    "06": "review",
+    "07": "review",
+    "08": "exclude",
+    "09": "review"
+  },
+
+  "labels": {
+    "00": "Vacant Residential",
+    "01": "Single Family",
+    "02": "Mobile Home",
+    "03": "Multi-Family (< 10 units)",
+    "04": "Condominium",
+    "05": "Cooperative",
+    "06": "Retirement Home",
+    "07": "Miscellaneous Residential",
+    "08": "Multi-Family (10+ units) / Apartments",
+    "09": "Residential Common Elements",
+    "10": "Vacant Commercial",
+    "40": "Industrial",
+    "50": "Agricultural",
+    "70": "Institutional",
+    "80": "Government",
+    "90": "Miscellaneous / Other"
+  },
+
+  "_comment_ranges": "Two-digit prefix ranges, inclusive, that default to 'exclude' when not individually listed in decisions above -- commercial/industrial/agricultural/institutional/government/misc.",
+  "exclude_ranges": [
+    [10, 39],
+    [40, 49],
+    [50, 69],
+    [70, 79],
+    [80, 89],
+    [90, 99]
+  ],
+
+  "default_decision": "review",
+
+  "teardown_infill": {
+    "_comment": "Signal only (a flag, not a score) -- see is_teardown_infill_candidate().",
+    "vacant_prefixes": ["00"],
+    "old_building_year_threshold": 1960
+  }
+}
