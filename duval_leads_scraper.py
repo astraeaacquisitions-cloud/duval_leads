@@ -419,6 +419,18 @@ MUNICIPAL_FILER_PATTERN = re.compile(
     re.I,
 )
 
+# Phase 6: not every municipal filer is a code violation specifically --
+# "CITY OF"/"DUVAL COUNTY" could just as easily be a demolition lien, a
+# nuisance-abatement lien, or an unpaid-utility lien. Only a filer name
+# that literally names code enforcement/compliance is unambiguous; the
+# broader MUNICIPAL_FILER_PATTERN match above is real signal but weaker,
+# so both get flagged as a likely code violation lien (unchanged
+# behavior) while this distinguishes how confident that specific label is.
+CODE_ENFORCEMENT_STRONG_PATTERN = re.compile(
+    r"\bCODE ENFORCEMENT\b|\bCODE COMPLIANCE\b|\bMUNICIPAL CODE\b",
+    re.I,
+)
+
 
 def new_pao_session():
     s = requests.Session()
@@ -817,8 +829,10 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
         is_multi = " GRANTOR " in owner_full.upper() or len(owner_full.split("/")) > 1
 
         is_code_violation = cat == "lien" and MUNICIPAL_FILER_PATTERN.search(other_party or "")
+        code_violation_confidence = None
         if is_code_violation:
             cat, cat_label = "code_violation", "Possible Code Violation Lien"
+            code_violation_confidence = "STRONG" if CODE_ENFORCEMENT_STRONG_PATTERN.search(other_party or "") else "MODERATE"
 
         prop_address = match.get("situs_address", "")
         prop_city = match.get("situs_city", "")
@@ -878,6 +892,7 @@ def build_records(days_back, delay_records, delay_pao, max_detail_scan, history=
             "last_sale_date": last_sale_date,
             "last_sale_price": match.get("last_sale_price"),
             "years_owned": years_owned,
+            "code_violation_confidence": code_violation_confidence,
         }
         take(doc_num, record)
     print(f"[records] {new_count} newly enriched, {len(raw) - new_count} reused from history")
@@ -998,7 +1013,7 @@ def enrich_records_with_ids(conn, records, run_id=None):
     effect on the accumulate-by-doc_num history mechanism records.json
     depends on."""
     doc_rows = conn.execute(
-        "SELECT source_name, doc_num, doc_type, property_id, owner_id FROM documents"
+        "SELECT source_name, doc_num, doc_type, property_id, owner_id, code_violation_confidence FROM documents"
     ).fetchall()
     prop_conf = {r["id"]: r["address_match_confidence"] for r in conn.execute(
         "SELECT id, address_match_confidence FROM properties")}
@@ -1009,13 +1024,15 @@ def enrich_records_with_ids(conn, records, run_id=None):
         "value_confidence, equity_signal, equity_confidence, equity_reasoning, "
         "active_lien_count, has_tax_distress, mortgage_estimate, "
         "tax_deed_stage, days_until_tax_sale, "
-        "foreclosure_stage, days_since_foreclosure_milestone FROM valuations")}
+        "foreclosure_stage, days_since_foreclosure_milestone, "
+        "code_enforcement_stage, code_violation_count FROM valuations")}
     scores = {}
     if run_id:
         scores = {r["property_id"]: r for r in conn.execute(
             "SELECT property_id, dealability_score, dealability_reason FROM scores WHERE scrape_run_id=?",
             (run_id,))}
     by_key = {(r["source_name"], r["doc_num"], r["doc_type"]): (r["property_id"], r["owner_id"]) for r in doc_rows}
+    code_conf_by_key = {(r["source_name"], r["doc_num"], r["doc_type"]): r["code_violation_confidence"] for r in doc_rows}
 
     for r in records:
         prop_id, owner_id = by_key.get((r.get("source", ""), r.get("doc_num", ""), r.get("doc_type", "")), (None, None))
@@ -1038,6 +1055,11 @@ def enrich_records_with_ids(conn, records, run_id=None):
         r["days_until_tax_sale"] = val["days_until_tax_sale"] if val else None
         r["foreclosure_stage"] = val["foreclosure_stage"] if val and val["foreclosure_stage"] else "FORECLOSURE_STAGE_NONE"
         r["days_since_foreclosure_milestone"] = val["days_since_foreclosure_milestone"] if val else None
+        r["code_enforcement_stage"] = val["code_enforcement_stage"] if val and val["code_enforcement_stage"] else "CODE_STAGE_NONE"
+        r["code_violation_count"] = val["code_violation_count"] if val else None
+        r["code_violation_confidence"] = code_conf_by_key.get((r.get("source", ""), r.get("doc_num", ""), r.get("doc_type", "")))
+        if r["code_enforcement_stage"] == "CODE_STAGE_REPEAT" and "CHRONIC_CODE_VIOLATIONS" not in r.get("flags", []):
+            r.setdefault("flags", []).append("CHRONIC_CODE_VIOLATIONS")
 
         sc = scores.get(prop_id)
         r["dealability_score"] = sc["dealability_score"] if sc else None

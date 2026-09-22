@@ -550,6 +550,8 @@ function computeCompoundGroups(records){
       days_until_tax_sale: (distress.find(g=>g.days_until_tax_sale!=null)||{}).days_until_tax_sale ?? null,
       foreclosure_stage: (distress.find(g=>g.foreclosure_stage && g.foreclosure_stage!=="FORECLOSURE_STAGE_NONE")||{}).foreclosure_stage || "FORECLOSURE_STAGE_NONE",
       days_since_foreclosure_milestone: (distress.find(g=>g.days_since_foreclosure_milestone!=null)||{}).days_since_foreclosure_milestone ?? null,
+      code_enforcement_stage: (distress.find(g=>g.code_enforcement_stage && g.code_enforcement_stage!=="CODE_STAGE_NONE")||{}).code_enforcement_stage || "CODE_STAGE_NONE",
+      code_violation_count: (distress.find(g=>g.code_violation_count!=null)||{}).code_violation_count ?? null,
       mail_address: (distress.find(g=>g.mail_address)||{}).mail_address || "",
       mail_city: (distress.find(g=>g.mail_city)||{}).mail_city || "",
       mail_state: (distress.find(g=>g.mail_state)||{}).mail_state || "",
@@ -994,6 +996,36 @@ function timelineCountdownBadgeHtml(r){
   return `<span class="equity-signal" style="border-color:${meta.color};color:${meta.color};margin-left:6px" title="Foreclosure -- ${meta.label}">⚖ ${text}</span>`;
 }
 
+const CODE_STAGE_META = {
+  CODE_STAGE_SINGLE_RECENT: {color:"var(--slate)",  label:"Single Violation -- Recent"},
+  CODE_STAGE_SINGLE_AGED:   {color:"var(--muted)",  label:"Single Violation -- Aged"},
+  CODE_STAGE_REPEAT:        {color:"var(--crit)",   label:"Chronic -- Repeat Violations"},
+};
+
+// Phase 6: code enforcement signal. Duval's Official Records has no
+// distinct "Code Violation" doc type -- these are an inferred lien-proxy
+// (a generic LIEN filed by a municipal entity), so this is always shown
+// as a clearly-labeled inference, never a confirmed code enforcement
+// case, with no fabricated fine amount or case status. Deliberately not
+// part of the Dealability Score -- this is a seller-distress signal for
+// the stacked-distress engine (a later phase), not a deal-feasibility one.
+function codeEnforcementTimelineHtml(r){
+  const stage = r.code_enforcement_stage || "CODE_STAGE_NONE";
+  if(stage === "CODE_STAGE_NONE") return "";
+  const meta = CODE_STAGE_META[stage] || {color:"var(--muted)", label:stage};
+  const count = r.code_violation_count;
+  return `
+    <div class="msection"><h4>Code Enforcement</h4>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="equity-signal" style="border-color:${meta.color};color:${meta.color}">${meta.label}</span>
+        <span style="font-size:12.5px">${count!=null?`${count} code violation lien${count===1?"":"s"} on file`:""}</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted2);margin-top:8px">Inferred from a lien filed by a city/county entity -- not a confirmed code enforcement case (no fine amount or case status is available from this data source).</div>
+      ${stage==="CODE_STAGE_REPEAT"?`<div class="value-warning" style="margin-top:8px">More than one code violation lien recorded against this property -- a chronic pattern, whether or not any were later resolved.</div>`:""}
+    </div>
+  `;
+}
+
 function reviewBadgesHtml(flags){
   flags = flags || [];
   const badges = [];
@@ -1003,6 +1035,8 @@ function reviewBadgesHtml(flags){
     badges.push(`<span class="badge-trust">⚑ Property type needs confirmation before contact</span>`);
   if(flags.includes("TEARDOWN_INFILL_CANDIDATE"))
     badges.push(`<span class="badge-confidence">⚑ Possible teardown/infill candidate</span>`);
+  if(flags.includes("CHRONIC_CODE_VIOLATIONS"))
+    badges.push(`<span class="badge-trust">⚑ Chronic code violations -- see Code Enforcement below</span>`);
   return badges.length ? `<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">${badges.join("")}</div>` : "";
 }
 
@@ -1033,6 +1067,7 @@ function openModal(r){
     ${valuationDealabilityHtml(r)}
     ${taxDeedTimelineHtml(r)}
     ${foreclosureTimelineHtml(r)}
+    ${codeEnforcementTimelineHtml(r)}
     <div class="msection"><h4>Flags</h4>
       <div class="flags-wrap">${(r.flags||[]).map(f=>`<span class="flag-pill">⚑ ${f}</span>`).join("")||"<span style='color:var(--muted);font-size:12px'>None</span>"}</div>
     </div>
@@ -1081,6 +1116,7 @@ function openCompoundModal(g){
     ${valuationDealabilityHtml(g)}
     ${taxDeedTimelineHtml(g)}
     ${foreclosureTimelineHtml(g)}
+    ${codeEnforcementTimelineHtml(g)}
     <div class="msection"><h4>All Filings At This Address</h4>
       <ul class="filing-list">${filingsHtml}</ul>
     </div>

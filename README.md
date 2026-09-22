@@ -33,6 +33,8 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
 - `config/foreclosure_timeline.json` -- Phase 5 foreclosure timeline
   thresholds (the post-judgment "stale" cutoff) and closing-runway points
   per stage.
+- `config/code_enforcement.json` -- Phase 6 code enforcement signal
+  thresholds (the "recent vs. aged" single-violation cutoff).
 
 ## Property-type classification (Phase 2)
 
@@ -200,6 +202,66 @@ pipeline already reads), similar in spirit to what Phase 4 did for tax
 deeds. `FORECLOSURE_STAGE_JUDGMENT_STALE` exists specifically to flag
 that gap rather than silently guessing an outcome once the statutory
 window has plausibly passed.
+
+## Code Enforcement Signal (Phase 6)
+
+Every property now also carries a `code_enforcement_stage` and
+`code_violation_count`, computed in `compute_code_enforcement_signal()`
+(`duval_leads_db.py`) and config-driven via
+`config/code_enforcement.json`. Each individual code-violation document
+also carries a `code_violation_confidence` (`STRONG`/`MODERATE`).
+
+**What this is built from, and what it isn't:** Duval's Official Records
+has no distinct "Code Violation" document type at all -- this has always
+been an *inferred lien-proxy* (a generic `LIEN` record filed by a
+city/county entity rather than a bank, HOA, or contractor; see
+`MUNICIPAL_FILER_PATTERN` in the scraper, unchanged from before this
+phase). Phase 6 adds two real, defensible refinements on top of that
+existing inference, without touching or narrowing the underlying
+detection:
+
+1. **Confidence tiering.** Not every municipal filer is a code
+   violation specifically -- "CITY OF"/"DUVAL COUNTY" could just as
+   easily be a demolition lien, a nuisance-abatement lien, or an unpaid
+   utility lien. Only a filer name that literally says "CODE
+   ENFORCEMENT"/"CODE COMPLIANCE"/"MUNICIPAL CODE" is unambiguous
+   (`STRONG`); the broader municipal-filer match is real signal but
+   weaker (`MODERATE`). Both still count as a code-violation lien for
+   filtering/scoring purposes -- this only labels how confident that
+   specific classification is, never removes a record from the
+   category.
+2. **A chronic-pattern signal**, `CODE_STAGE_REPEAT` -- a property with
+   *two or more* code-violation liens recorded against it, which is real
+   and countable (not an inference stacked on an inference): a genuine
+   chronic-neglect pattern. Stages:
+   - `CODE_STAGE_NONE` -- no code-violation lien on file (most leads).
+   - `CODE_STAGE_SINGLE_RECENT` -- exactly one, filed within the last
+     `recent_days` (default 180).
+   - `CODE_STAGE_SINGLE_AGED` -- exactly one, older than that. This
+     pipeline can't confirm whether it was ever resolved -- there's no
+     reliable cross-reference from a `SATISFACTION`/`RELEASE` record
+     back to the specific lien it clears, so "aged" is informational
+     recency, never a claim the case is closed.
+   - `CODE_STAGE_REPEAT` -- two or more. Also sets the
+     `CHRONIC_CODE_VIOLATIONS` flag (shown as a review badge in the
+     dashboard modal).
+
+**Deliberately not wired into the Dealability Score.** Chronic code
+violations are a seller-*distress*/motivation signal, not a deal-
+*feasibility* signal -- Dealability's existing "manageable liens"
+component already counts every code-violation document toward
+`active_lien_count` like any other active distress record, so the
+scoring impact already exists there. This phase's job is to surface and
+label the richer signal (confidence + chronicity) for the
+stacked-distress/contact-priority engine that a later phase builds, not
+to retrofit the dealability formula.
+
+**Known gap:** no fine amount, case status, or hearing date is scraped
+for any of this -- Duval's actual Municipal Code Compliance case
+tracking lives on a separate system from the Official Records lien
+search this pipeline reads. Every stage and label here is built strictly
+from the fact that a municipal lien was recorded, and how many times,
+never from a fabricated case status.
 
 ## Data ownership
 

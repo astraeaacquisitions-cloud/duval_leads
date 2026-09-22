@@ -145,6 +145,11 @@ CREATE TABLE IF NOT EXISTS documents (
     amount TEXT,
     property_id TEXT,
     owner_id TEXT,
+    -- Phase 6: STRONG (filer literally names code enforcement/compliance)
+    -- or MODERATE (a broader municipal-filer match -- could be a
+    -- demolition/nuisance/utility lien instead), only set for cat=
+    -- 'code_violation' documents. Never a claim of confirmed case status.
+    code_violation_confidence TEXT,
     flags_json TEXT,
     legacy_score INTEGER,
     source_name TEXT,
@@ -271,6 +276,8 @@ CREATE TABLE IF NOT EXISTS valuations (
     days_until_tax_sale INTEGER,
     foreclosure_stage TEXT,
     days_since_foreclosure_milestone INTEGER,
+    code_enforcement_stage TEXT,
+    code_violation_count INTEGER,
     computed_at TEXT
 );
 
@@ -372,6 +379,9 @@ SCHEMA_MIGRATIONS = [
     ("valuations", "days_until_tax_sale", "INTEGER"),
     ("valuations", "foreclosure_stage", "TEXT"),
     ("valuations", "days_since_foreclosure_milestone", "INTEGER"),
+    ("documents", "code_violation_confidence", "TEXT"),
+    ("valuations", "code_enforcement_stage", "TEXT"),
+    ("valuations", "code_violation_count", "INTEGER"),
 ]
 
 
@@ -623,12 +633,13 @@ def persist_records(conn, records, run_id, source_note=""):
         first_seen = existing["first_seen_at"] if existing else ts
         conn.execute(
             "INSERT OR REPLACE INTO documents (id, doc_num, doc_type, cat, cat_label, filed_date, "
-            "owner_name, other_party, legal_desc, amount, property_id, owner_id, flags_json, "
-            "legacy_score, source_name, source_url, scrape_run_id, raw_json, first_seen_at, last_seen_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "owner_name, other_party, legal_desc, amount, property_id, owner_id, code_violation_confidence, "
+            "flags_json, legacy_score, source_name, source_url, scrape_run_id, raw_json, first_seen_at, last_seen_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (doc_id, doc_num, doc_type, r.get("cat", ""), r.get("cat_label", ""), r.get("filed", ""),
              r.get("owner", ""), r.get("grantee", ""), r.get("legal", ""), r.get("amount"),
-             prop_id, owner_id, json.dumps(r.get("flags", [])), r.get("score"), source,
+             prop_id, owner_id, r.get("code_violation_confidence"),
+             json.dumps(r.get("flags", [])), r.get("score"), source,
              r.get("clerk_url", ""), run_id, json.dumps(r, ensure_ascii=False), first_seen, ts),
         )
 
@@ -961,6 +972,81 @@ def compute_foreclosure_timeline(conn, property_id, config=None, today=None):
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 6: code enforcement signal.
+#
+# Duval's Official Records has no distinct "Code Violation" doc type --
+# these are already an inferred lien-proxy (a generic LIEN filed by a
+# municipal entity, see MUNICIPAL_FILER_PATTERN in the scraper), and this
+# builds on that same "clearly labeled inference, never a confirmed case"
+# discipline: no fine amount, case status, or hearing date is scraped, so
+# this is built purely from real, countable facts already in `documents`
+# -- how many such liens exist for a property, and how recent the latest
+# one is. Deliberately NOT wired into the Dealability Score (which is
+# about deal feasibility, not seller motivation/distress) -- this is
+# seller-distress signal data for the stacked-distress/contact-priority
+# engine, Phase 8.
+# ---------------------------------------------------------------------------
+
+CODE_ENFORCEMENT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "code_enforcement.json"
+)
+
+
+def load_code_enforcement_config(path=CODE_ENFORCEMENT_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+CODE_ENFORCEMENT_CONFIG = load_code_enforcement_config()
+
+
+def compute_code_enforcement_signal(conn, property_id, config=None, today=None):
+    """Returns (stage, count, days_since_most_recent, reasoning) for one
+    property, built entirely from documents already recorded with
+    cat='code_violation'. `count` >= 2 (CODE_STAGE_REPEAT) is the
+    strongest real signal here -- a property with more than one municipal
+    lien recorded against it, a genuine chronic-neglect pattern, not an
+    inference stacked on an inference."""
+    config = config if config is not None else CODE_ENFORCEMENT_CONFIG
+    today = today or datetime.date.today()
+
+    rows = conn.execute(
+        "SELECT filed_date FROM documents WHERE property_id=? AND cat='code_violation' "
+        "ORDER BY filed_date DESC",
+        (property_id,),
+    ).fetchall()
+    count = len(rows)
+
+    if count == 0:
+        return "CODE_STAGE_NONE", 0, None, "No code violation lien on file for this property."
+
+    most_recent = _parse_iso_date(rows[0]["filed_date"]) if rows[0]["filed_date"] else None
+    days_since = (today - most_recent).days if most_recent else None
+
+    if count >= 2:
+        return "CODE_STAGE_REPEAT", count, days_since, (
+            f"{count} separate code violation liens recorded against this property -- a chronic pattern, "
+            "not an isolated incident, whether or not any were later resolved."
+        )
+
+    recent_cutoff = config.get("recent_days", 180)
+    if days_since is not None and days_since <= recent_cutoff:
+        return "CODE_STAGE_SINGLE_RECENT", count, days_since, (
+            f"One code violation lien recorded {days_since} day{'s' if days_since != 1 else ''} ago -- "
+            "a single, recent filing."
+        )
+    if days_since is not None:
+        return "CODE_STAGE_SINGLE_AGED", count, days_since, (
+            f"One code violation lien recorded {days_since} days ago -- an older, isolated filing. This "
+            "pipeline can't confirm whether it was ever resolved (no reliable cross-reference from a "
+            "satisfaction/release record back to the lien it clears)."
+        )
+    return "CODE_STAGE_SINGLE_RECENT", count, None, (
+        "One code violation lien on file but its filed date didn't parse -- treating recency as unknown."
+    )
+
+
 def compute_dealability_score(conn, property_id, config=None):
     """Computes the Dealability Score (0-100) for one property from
     what's already in the database -- no network calls. Returns
@@ -1118,15 +1204,18 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
         (score, reason, signal, eq_conf, eq_reason, lien_count, has_tax,
          tax_stage, days_until_tax_sale, foreclosure_stage, days_since_foreclosure_milestone) = \
             compute_dealability_score(conn, property_id, config)
+        code_stage, code_count, _code_days, _code_reason = compute_code_enforcement_signal(conn, property_id)
         conn.execute(
             "UPDATE valuations SET active_lien_count=?, has_tax_distress=?, "
             "equity_signal=?, equity_confidence=?, equity_reasoning=?, "
             "tax_deed_stage=?, days_until_tax_sale=?, "
             "foreclosure_stage=?, days_since_foreclosure_milestone=?, "
+            "code_enforcement_stage=?, code_violation_count=?, "
             "value_confidence=?, computed_at=? WHERE property_id=?",
             (lien_count, int(has_tax), signal, eq_conf, eq_reason,
              tax_stage, days_until_tax_sale,
              foreclosure_stage, days_since_foreclosure_milestone,
+             code_stage, code_count,
              "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN", ts, property_id),
         )
         conn.execute(
@@ -1248,6 +1337,7 @@ def export_csv(conn, path):
         "v.pao_assessed_value, v.pao_market_value, v.equity_signal, v.equity_confidence, "
         "v.active_lien_count, v.mortgage_estimate, v.tax_deed_stage, v.days_until_tax_sale, "
         "v.foreclosure_stage, v.days_since_foreclosure_milestone, "
+        "v.code_enforcement_stage, v.code_violation_count, "
         "(SELECT dealability_score FROM scores s WHERE s.property_id = p.id "
         " ORDER BY computed_at DESC LIMIT 1) AS dealability_score "
         "FROM documents d "
@@ -1264,6 +1354,7 @@ def export_csv(conn, path):
             "PAO Assessed Value", "PAO Market Value", "Equity Signal", "Equity Confidence",
             "Active Lien Count", "Mortgage Estimate", "Tax Deed Stage", "Days Until Tax Sale",
             "Foreclosure Stage", "Days Since Foreclosure Milestone",
+            "Code Enforcement Stage", "Code Violation Count", "Code Violation Confidence (this document)",
             "Dealability Score",
             "Suppressed", "Category", "Document Type", "Filed Date",
             "Document Number", "Amount", "Legal Description", "Flags", "Legacy Score", "Source",
@@ -1290,6 +1381,9 @@ def export_csv(conn, path):
                 r["days_until_tax_sale"] if r["days_until_tax_sale"] is not None else "",
                 r["foreclosure_stage"] or "FORECLOSURE_STAGE_NONE",
                 r["days_since_foreclosure_milestone"] if r["days_since_foreclosure_milestone"] is not None else "",
+                r["code_enforcement_stage"] or "CODE_STAGE_NONE",
+                r["code_violation_count"] if r["code_violation_count"] is not None else "",
+                r["code_violation_confidence"] or "",
                 r["dealability_score"] if r["dealability_score"] is not None else "",
                 "yes" if r["property_id"] in suppressed_props else "no",
                 r["cat"] or "", r["doc_type"] or "", r["filed_date"] or "", r["doc_num"] or "",

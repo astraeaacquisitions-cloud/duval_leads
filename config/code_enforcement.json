@@ -1,0 +1,6 @@
+{
+  "_comment": "Phase 6 code enforcement signal thresholds. Duval's Official Records has no distinct 'Code Violation' doc type -- these are inferred from generic LIEN records filed by a municipal entity (see MUNICIPAL_FILER_PATTERN in the scraper), so this stays a clearly-labeled inferred lien-proxy, never treated as a confirmed code enforcement case. No fine amount, case status, or hearing date is scraped -- only that a municipal lien was recorded and how many times, which is what this signal is built from.",
+
+  "recent_days": 180,
+  "_recent_days_comment": "A single code-violation lien filed within this window is 'recent'; older than that is 'aged' -- informational recency, not a claim the case is closed (this pipeline has no reliable cross-reference from a SATISFACTION/RELEASE record back to which original lien it satisfies)."
+}
