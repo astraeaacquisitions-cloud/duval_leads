@@ -1922,6 +1922,17 @@ def export_hubspot_csv(conn, path):
     outreach angle) as extra columns so a rep importing this into HubSpot
     isn't starting from a bare name and address -- map these to custom
     properties in HubSpot's import wizard."""
+    # entity_type='property' is the only path the dashboard/sync script actually
+    # writes into hubspot_export_flags, and h.entity_id there is a property_id --
+    # not an owner_id -- so the owner has to be resolved through ownerships. Pick
+    # each property's current owner, most recently seen; ties broken by owner_id
+    # for determinism. entity_type='owner' rows (no code path writes these today,
+    # but the schema allows approving an owner directly) resolve straight off
+    # entity_id instead.
+    owner_for_property = (
+        "(SELECT os.owner_id FROM ownerships os WHERE os.property_id = h.entity_id "
+        "AND os.is_current = 1 ORDER BY os.last_seen_at DESC, os.owner_id LIMIT 1)"
+    )
     rows = conn.execute(
         "SELECT h.entity_type, h.entity_id, h.approved_by, h.approved_at, "
         "p.re_number, p.situs_address, p.situs_city, p.situs_state, p.situs_zip, "
@@ -1930,7 +1941,8 @@ def export_hubspot_csv(conn, path):
         "sc.contact_priority_score, sc.tier, sc.tier_reason, sc.outreach_angle "
         "FROM hubspot_export_flags h "
         "LEFT JOIN properties p ON p.id = h.entity_id AND h.entity_type='property' "
-        "LEFT JOIN owners o ON o.id = h.entity_id AND h.entity_type='owner' "
+        "LEFT JOIN owners o ON o.id = CASE h.entity_type "
+        " WHEN 'owner' THEN h.entity_id WHEN 'property' THEN " + owner_for_property + " END "
         "LEFT JOIN (SELECT s1.* FROM scores s1 INNER JOIN "
         " (SELECT property_id, MAX(computed_at) AS max_ts FROM scores GROUP BY property_id) latest "
         " ON s1.property_id = latest.property_id AND s1.computed_at = latest.max_ts) sc "

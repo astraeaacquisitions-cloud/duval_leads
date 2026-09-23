@@ -8,3 +8,7 @@ __pycache__/
 # durable copy (per README's data-ownership table) once this runs for
 # real; committing today's test data would be misleading.
 data/
+
+# Generated CRM export -- carries real owner names/mailing addresses, and
+# is regenerated on demand via export_hubspot_csv(); not something to track.
+hubspot_export.csv
