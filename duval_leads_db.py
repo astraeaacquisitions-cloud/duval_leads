@@ -1767,12 +1767,17 @@ def sync_dashboard_leads_state(conn, leads_by_property_id):
                 "created_by": doc.get("suppressed_by", ""),
                 "created_at": doc.get("suppressed_at", now_iso()),
             })
-        if doc.get("approved_for_hubspot"):
-            hubspot_approvals.append({
-                "entity_type": "property", "entity_id": property_id,
-                "approved_by": doc.get("approved_by", ""),
-                "approved_at": doc.get("approved_at", now_iso()),
-            })
+        # Always upsert an approval row, even when approved_for_hubspot is
+        # false, so unchecking the dashboard's checkbox actually revokes a
+        # prior approval instead of leaving hubspot_export_flags stuck --
+        # merge_dashboard_state upserts by (entity_type, entity_id), so a
+        # cleared (None) approved_by here correctly drops the row out of
+        # export_hubspot_csv's "WHERE approved_by IS NOT NULL" gate.
+        hubspot_approvals.append({
+            "entity_type": "property", "entity_id": property_id,
+            "approved_by": doc.get("approved_by") if doc.get("approved_for_hubspot") else None,
+            "approved_at": doc.get("approved_at") if doc.get("approved_for_hubspot") else None,
+        })
     return merge_dashboard_state(conn, suppressions=suppressions, hubspot_approvals=hubspot_approvals)
 
 
