@@ -1054,6 +1054,16 @@ def enrich_records_with_ids(conn, records, run_id=None):
         r["address_match_confidence"] = prop_conf.get(prop_id, "unmatched")
         r["owner_identity_confidence"] = owner_conf.get(owner_id, "unmatched")
 
+        # Probate/estate language in the owner name (see
+        # db.is_probate_estate_name) -- backfilled here, not only in
+        # db.persist_records, so a record already sitting in records.json
+        # from before this check existed also gets flagged for the
+        # dashboard's Review Required Only filter on the next run, without
+        # needing to be re-scraped.
+        if db.is_probate_estate_name(r.get("owner", "")) and \
+                "PROBATE_REPRESENTATIVE_REVIEW_REQUIRED" not in r.get("flags", []):
+            r.setdefault("flags", []).append("PROBATE_REPRESENTATIVE_REVIEW_REQUIRED")
+
         val = valuations.get(prop_id)
         r["pao_assessed_value"] = val["pao_assessed_value"] if val else None
         r["pao_market_value"] = val["pao_market_value"] if val else None

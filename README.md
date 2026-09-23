@@ -48,6 +48,9 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
 - `config/outreach_angles.json` -- Phase 9 rule-based outreach-angle
   templates. Edit to change the suggested talking points -- no code
   changes needed.
+- `test_probate_estate_review.py` -- synthetic, throwaway-db test fixture
+  for the probate/estate `display_name` review-required check (see
+  "Seller Profile Signals" below). Run: `python test_probate_estate_review.py`.
 
 ## Property-type classification (Phase 2)
 
@@ -330,6 +333,19 @@ a contactable person. Same discipline as trust ownership (Phase 1): a
 `PROBATE_REPRESENTATIVE_REVIEW_REQUIRED` flag are generated so nobody
 assumes a relative, heir, or occupant has authority to sell without
 confirming the actual personal representative.
+
+This review-required check is not limited to documents actually filed as
+`cat='probate'`: `duval_leads_db.is_probate_estate_name()` also matches
+probate/estate language in the owner's `display_name` itself (e.g. "CHEW
+RUTH ESTATE", "SMITH JOHN DECEASED", a life estate) -- case-insensitive
+and word-boundary aware, so it doesn't false-positive on a company name
+like "TRITEN REAL ESTATE PARTNERS." This catches an estate that shows up
+on an ordinary lien, tax, or code-enforcement document without ever going
+through probate court, which the `cat='probate'`/`is_trust` checks alone
+missed. It applies the identical treatment as trust ownership throughout:
+the same research task, the same ownership-clarity deduction in the
+Dealability Score, and the same review-required prefix on the outreach
+angle.
 
 **Deliberately not wired into the Dealability Score**, same reasoning
 as Phase 6: these are seller-distress/motivation signals for the

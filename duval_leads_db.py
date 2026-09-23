@@ -592,6 +592,23 @@ def _upsert_owner(conn, ts, display_name, mailing_address, mailing_city, mailing
     return owner_id, confidence
 
 
+# Probate/estate ownership: a display_name naming a decedent's estate (e.g.
+# "CHEW RUTH ESTATE", "ESTATE OF JOHN SMITH", "SMITH JOHN DECEASED") or a
+# life estate interest means the recorded party isn't a living person who
+# can sign a deed -- the same fundamental problem as trust ownership below,
+# even when no cat='probate' document was ever filed for this owner (e.g. a
+# tax or code-enforcement lien against an estate that never went through
+# probate court). "REAL ESTATE" is excluded -- an extremely common phrase in
+# company names (e.g. "TRITEN REAL ESTATE PARTNERS") that has nothing to do
+# with a probate estate. Word-boundary aware, so plural subdivision-style
+# names ("GREENWAY ESTATES") don't match either.
+PROBATE_ESTATE_NAME_PATTERN = re.compile(r"\bDECEASED\b|(?<!REAL\s)\bESTATE\b", re.I)
+
+
+def is_probate_estate_name(display_name):
+    return bool(PROBATE_ESTATE_NAME_PATTERN.search(display_name or ""))
+
+
 def persist_records(conn, records, run_id, source_note=""):
     """Upserts every scraped record into properties/owners/ownerships/
     documents/evidence. Idempotent: re-running against the same document
@@ -620,6 +637,7 @@ def persist_records(conn, records, run_id, source_note=""):
             owner_name, re.I,
         ))
         is_trust = bool(re.search(r"\bTRUST\b", owner_name, re.I))
+        is_probate_estate = is_probate_estate_name(owner_name)
 
         prop_id, prop_conf = _upsert_property(
             conn, ts, r.get("re_number", ""), r.get("prop_address", ""),
@@ -647,6 +665,15 @@ def persist_records(conn, records, run_id, source_note=""):
 
         existing = conn.execute("SELECT id, first_seen_at FROM documents WHERE id=?", (doc_id,)).fetchone()
         first_seen = existing["first_seen_at"] if existing else ts
+        # Enrich the persisted flags with PROBATE_REPRESENTATIVE_REVIEW_REQUIRED
+        # when the owner name itself carries probate/estate language, even if
+        # the incoming record's own flags list (computed at scrape time, or
+        # loaded from an older records.json/backup.json predating this check)
+        # doesn't already have it -- this is what lets compute_confidence_score
+        # and compute_outreach_angle pick it up immediately on the next run.
+        doc_flags = list(r.get("flags", []))
+        if is_probate_estate and "PROBATE_REPRESENTATIVE_REVIEW_REQUIRED" not in doc_flags:
+            doc_flags.append("PROBATE_REPRESENTATIVE_REVIEW_REQUIRED")
         conn.execute(
             "INSERT OR REPLACE INTO documents (id, doc_num, doc_type, cat, cat_label, filed_date, "
             "owner_name, other_party, legal_desc, amount, property_id, owner_id, code_violation_confidence, "
@@ -655,7 +682,7 @@ def persist_records(conn, records, run_id, source_note=""):
             (doc_id, doc_num, doc_type, r.get("cat", ""), r.get("cat_label", ""), r.get("filed", ""),
              r.get("owner", ""), r.get("grantee", ""), r.get("legal", ""), r.get("amount"),
              prop_id, owner_id, r.get("code_violation_confidence"),
-             json.dumps(r.get("flags", [])), r.get("score"), source,
+             json.dumps(doc_flags), r.get("score"), source,
              r.get("clerk_url", ""), run_id, json.dumps(r, ensure_ascii=False), first_seen, ts),
         )
 
@@ -694,15 +721,21 @@ def persist_records(conn, records, run_id, source_note=""):
                 priority="normal",
             )
 
-        if r.get("cat") == "probate" and prop_id:
-            # DirectName on a probate record is conventionally the decedent --
-            # a legitimate estate-sale lead, but not a person anyone can
-            # contact. Same discipline as trust ownership: flag for review,
-            # never assume a relative/heir/occupant has authority to sell.
+        if (r.get("cat") == "probate" or is_probate_estate) and prop_id:
+            # DirectName on a probate record is conventionally the decedent,
+            # and an owner display_name carrying probate/estate language
+            # (e.g. "CHEW RUTH ESTATE", "SMITH JOHN DECEASED") means the same
+            # thing even when no probate document was ever filed for this
+            # owner -- a legitimate estate-sale lead, but not a person anyone
+            # can contact. Same discipline as trust ownership: flag for
+            # review, never assume a relative/heir/occupant has authority to
+            # sell.
+            basis = ("is recorded as the decedent on this probate document" if r.get("cat") == "probate"
+                     else "is named using probate/estate language")
             _add_research_task_if_absent(
                 conn, "verify_probate_representative", property_id=prop_id, owner_id=owner_id,
-                description=f"PROBATE_REPRESENTATIVE_REVIEW_REQUIRED: {owner_name!r} is recorded as the "
-                             f"decedent -- identify the actual personal representative/heir with authority "
+                description=f"PROBATE_REPRESENTATIVE_REVIEW_REQUIRED: {owner_name!r} {basis} -- "
+                             f"identify the actual personal representative/heir with authority "
                              f"to sell before treating any contact as decision-maker.",
                 priority="normal",
             )
@@ -1260,9 +1293,16 @@ def compute_dealability_score(conn, property_id, config=None):
         lien_desc = f"{active_lien_count} active distress records -- heavily encumbered"
     reasons.append(f"Liens: {lien_points}/{mp.get('manageable_liens',10)} -- {lien_desc} (mortgage balance unknown -- see research queue).")
 
-    # -- Ownership clarity: from Phase 1's identity confidence + trust/entity flags --
+    # -- Ownership clarity: from Phase 1's identity confidence + trust/entity
+    # flags, plus probate/estate language in the owner's display_name (see
+    # is_probate_estate_name) -- the same problem as trust ownership: the
+    # named party isn't a living person who can sign a deed until an
+    # administrator/personal representative is identified. Checked live off
+    # display_name rather than a stored flag, so a property already in the
+    # database gets this corrected the next time scores are recomputed, not
+    # only the next time its documents are re-scraped.
     owners = conn.execute(
-        "SELECT o.is_entity, o.is_trust, o.identity_confidence FROM ownerships ow "
+        "SELECT o.display_name, o.is_entity, o.is_trust, o.identity_confidence FROM ownerships ow "
         "JOIN owners o ON o.id = ow.owner_id WHERE ow.property_id=?", (property_id,)
     ).fetchall()
     oc = config.get("ownership_clarity", {})
@@ -1271,11 +1311,19 @@ def compute_dealability_score(conn, property_id, config=None):
         owner_desc = "no confirmed owner on file"
     else:
         any_trust = any(o["is_trust"] for o in owners)
+        any_probate_estate = any(is_probate_estate_name(o["display_name"]) for o in owners)
         any_entity = any(o["is_entity"] for o in owners)
         best_conf = any(o["identity_confidence"] in ("verified_parcel", "name_and_mailing_address") for o in owners)
-        if any_trust:
+        if any_trust and any_probate_estate:
+            owner_points = min(oc.get("trust_review_required_points", 6),
+                                oc.get("probate_estate_review_required_points", 6))
+            owner_desc = "trust and probate/estate ownership -- trustee/personal representative authority not yet verified"
+        elif any_trust:
             owner_points = oc.get("trust_review_required_points", 6)
             owner_desc = "trust ownership -- trustee authority not yet verified"
+        elif any_probate_estate:
+            owner_points = oc.get("probate_estate_review_required_points", 6)
+            owner_desc = "probate/estate ownership -- personal representative not yet verified"
         elif any_entity:
             owner_points = oc.get("entity_owned_points", 8)
             owner_desc = "entity-held title"
