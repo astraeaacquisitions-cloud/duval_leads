@@ -1,0 +1,32 @@
+{
+  "_comment": "Phase 10 active-campaign definition. Edit this file to retune the campaign -- no code changes needed. This does not expand or switch markets automatically: adding a second campaign later means adding a new entry here and code to pick between them, not changing this one's geo_fence.",
+
+  "active_campaign": {
+    "name": "jacksonville_duval_2026",
+    "market_label": "Jacksonville / Duval County, FL",
+    "decision_date": "2026-09-26",
+    "review_date": "2026-10-26",
+    "_dates_comment": "Decision/review dates are informational bookkeeping only -- nothing in this pipeline auto-disables the campaign on review_date. A human decides whether to continue, adjust, or retire it.",
+
+    "geo_fence": {
+      "_comment": "Real geographic fields, not 'Jacksonville' text matching (the city 'Jacksonville' also exists outside Florida, and several incorporated Duval-adjacent beach towns -- Atlantic Beach, Neptune Beach, Jacksonville Beach, Baldwin -- don't contain the word 'Jacksonville' at all). An explicit county column from an external source (PropWire almost always includes one) is checked FIRST and is authoritative; the ZIP list below is only the fallback when no county field is present.",
+      "county_field_values": ["Duval", "Duval County", "Duval, FL", "Duval Co", "Duval Co."],
+      "zip_codes": [
+        "32099", "32201", "32202", "32203", "32204", "32205", "32206", "32207",
+        "32208", "32209", "32210", "32211", "32212", "32214", "32216", "32217",
+        "32218", "32219", "32220", "32221", "32222", "32223", "32224", "32225",
+        "32226", "32228", "32229", "32231", "32232", "32233", "32234", "32235",
+        "32236", "32238", "32239", "32240", "32241", "32244", "32245", "32246",
+        "32247", "32250", "32254", "32255", "32256", "32257", "32258", "32266",
+        "32277"
+      ],
+      "_zip_known_gap": "Best-effort list assembled from public county/ZIP references, not an authoritative USPS/Census crosswalk fetch (that lookup was blocked in this environment -- see README Phase 10 'known gap'). A few genuinely boundary-straddling ZIPs (e.g. 32082 Ponte Vedra Beach, 32259 Fruit Cove) are deliberately left OFF this list because they're predominantly St. Johns County, not Duval -- if a real Duval parcel legitimately uses one of those, it will be misclassified out_of_market and needs a manual add here. Verify against the county field whenever the source provides one instead of relying on this list alone."
+    },
+
+    "property_type_prefixes": ["01"],
+    "_property_type_comment": "Campaign focus is single-family houses specifically (DOR prefix '01'), narrower than Phase 2's broader 'include' set (which also includes vacant residential land, prefix '00'). This only gates the new campaign_eligibility field -- it does not change Phase 2's own property_type_decision or exclude vacant land from the rest of the pipeline.",
+
+    "tired_landlord_min_years": 20,
+    "_tenure_comment": "Ownership/acquisition tenure, computed dynamically against the run date from the latest non-ambiguous recorded transfer -- never the property's construction year. See compute_tenure_priority() in duval_leads_db.py."
+  }
+}

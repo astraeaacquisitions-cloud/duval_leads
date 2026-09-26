@@ -48,6 +48,26 @@ motivated-seller lead, and publishes it as a filterable/sortable dashboard.
 - `config/outreach_angles.json` -- Phase 9 rule-based outreach-angle
   templates. Edit to change the suggested talking points -- no code
   changes needed.
+- `config/campaign.json` -- Phase 10 active-campaign definition: geo-fence
+  (county field + Duval ZIP fallback), single-family property-type scope,
+  decision/review dates, tired-landlord tenure threshold.
+- `config/outreach_templates.json` -- Phase 10 opening call/text templates
+  (cold-open + warm FSBO-reply/existing-conversation variants).
+- `config/propwire_field_map.json` -- Phase 10 PropWire CSV header
+  mapping, UNVALIDATED against a real export (no sample was available).
+- `config/fsbo_field_map.json` -- Phase 10 FSBO capture-sheet CSV header
+  mapping.
+- `import_propwire.py` -- Phase 10, imports a PropWire CSV export via the
+  field-map adapter above, reusing `persist_records()`/`property_identity()`/
+  `owner_identity()` for dedup. `--dry-run` persists into a throwaway
+  in-memory database only and prints the campaign-eligibility breakdown;
+  `--dump-headers` shows the file's actual column headers.
+- `import_skiptrace_results.py` -- Phase 10, applies a skip-tracing
+  vendor's returned CSV back onto `owners` by the stable Lead ID
+  `export_skiptrace_csv()` exported. Same "throwaway `--db` first"
+  discipline as the other hand-run scripts.
+- `import_fsbo_csv.py` -- Phase 10, FSBO (Facebook Marketplace / Zillow)
+  manual-capture CSV intake via `config/fsbo_field_map.json`.
 
 ## Property-type classification (Phase 2)
 
@@ -471,6 +491,171 @@ the record (their motivation, health, marital status, finances beyond
 what's recorded, etc.). The dashboard's own modal repeats this caveat
 next to every angle it shows.
 
+## Jacksonville Campaign Rules, PropWire/FSBO Intake & Skip Tracing (Phase 10)
+
+Everything below is layered on top of the Phase 1-9 pipeline, additively:
+it never deletes or rewrites a property/owner row, never overrides Phase
+2's own `property_type_decision`, and never touches a lead from outside
+the active campaign's own bookkeeping. There is no "other market" data in
+this pipeline today, but nothing here assumes there never will be --
+`config/campaign.json` holds exactly one `active_campaign` block, and a
+second campaign later means adding a new entry there plus code to pick
+between them, not editing this one's geo-fence.
+
+**Active campaign:** Jacksonville / Duval County, FL, single-family
+houses. `decision_date` (2026-09-26) and `review_date` (2026-10-26) in
+`config/campaign.json` are informational bookkeeping only -- nothing
+auto-disables the campaign on the review date; a human decides whether to
+continue, adjust, or retire it.
+
+**Individual owners only (`compute_campaign_eligibility()`).** Every
+property now carries a `campaign_eligibility`
+(`ready_to_contact`/`review`/`out_of_market`/`excluded_entity`/
+`excluded_property_type`) and a plain-language reason, computed in the
+same per-property loop as every other phase's signals. Owner
+classification (`classify_owner_type()`) uses an authoritative field from
+the source data when one is given and recognized (e.g. a PropWire "Owner
+Type" column), and falls back to name-parsing otherwise -- the same
+`LAND TRUST`/`LLC`/etc. pattern the primary Duval Clerk pipeline has
+always used to exclude entities outright, plus a new estate pattern
+(deliberately excluding "Real Estate" as a business phrase -- see
+`_ESTATE_PATTERN`'s docstring) and a trust pattern. **Never assumes a
+named trustee or personal representative is the actual individual title
+holder** -- a name that matches the trust/estate pattern classifies
+`trust`/`estate` regardless of what individual name also appears in the
+string, same discipline Phase 1/7 already established for trust/probate
+review flags (which this phase now also applies regardless of which
+document category surfaced the property -- previously
+`TRUST_OWNERSHIP_REVIEW_REQUIRED`/`PROBATE_REPRESENTATIVE_REVIEW_REQUIRED`
+only fired for trust filings and Probate Documents specifically; an
+estate-named owner on an ordinary lien or judgment wouldn't otherwise have
+been caught by the confidence penalty or outreach-angle prefix).
+
+Multiple individual co-owners on one property are allowed and stay
+`ready_to_contact`. Any entity owner excludes the property outright
+(`excluded_entity`). Trust, estate, unknown, or a genuine mix of
+individual-and-entity ownership all go to `review` -- never assumed
+either way. A property whose Florida DOR use code is missing entirely
+(routine for a PropWire/FSBO row, which carries no Duval-PAO-specific
+code) also goes to `review` rather than being silently excluded or
+included -- the exact same "unrecognized code is never silently excluded
+OR silently included" principle Phase 2 established.
+
+**Geo-fence, on real fields, not "Jacksonville" text matching
+(`is_in_campaign_geo_fence()`).** An explicit county column from the
+source data is checked first and is authoritative when present (PropWire
+almost always supplies one); a curated Duval County ZIP list is the
+fallback when no county field exists. Deliberately never matches on the
+city name "Jacksonville" as a substring -- several incorporated
+Duval-adjacent beach towns (Atlantic Beach, Neptune Beach, Baldwin) don't
+contain that word at all, and the city name exists outside Florida too.
+
+**Known gap:** the ZIP fallback list in `config/campaign.json` was
+assembled from public references, not a fetched authoritative USPS/Census
+county-to-ZIP crosswalk -- that lookup was attempted and blocked by this
+environment's network egress policy. A handful of genuinely
+boundary-straddling ZIPs (32082 Ponte Vedra Beach, 32259 Fruit Cove) are
+deliberately left off the list because they're predominantly St. Johns
+County, not Duval; both were confirmed correctly excluded against real
+production data (six properties at 32259/32081 that had somehow entered
+this pipeline's dataset were caught as `out_of_market` by this phase, not
+before it). If a real Duval parcel legitimately uses a ZIP not on the
+list, it's misclassified `out_of_market` and needs a manual add to the
+config -- there is no code change required to fix that.
+
+**Tired-landlord tenure priority (`compute_tenure_priority()`).** A
+separate, explainable score from Dealability/Contact Priority, stored on
+`valuations` (`tenure_priority_score`/`_reason`/`tenure_ambiguous_transfer`).
+Tenure is computed dynamically against the run date from the latest
+recorded transfer (`last_sale_date`) -- **never** the property's
+construction year. A transfer at or below the same nominal-sale-price
+floor Phase 3's equity signal already uses
+(`dealability_weights.json`'s `equity.nominal_sale_price_floor`) is
+flagged `tenure_ambiguous_transfer` rather than trusted as establishing a
+new beneficial owner -- e.g. a $10 quitclaim into a family member's name
+is administrative/related-party, not necessarily a new arm's-length
+owner. Missing `last_sale_date` stays unknown, never assumed either way.
+Absentee mailing address (Phase 7) is folded in as a labeled **proxy**
+for non-owner-occupancy, never asserted as confirmed rental status --
+**there is no rental-registration or lease data source in this
+pipeline**, and nothing here claims one. `export_tired_landlord_csv()`
+produces the ranked list; there is no dashboard UI for it yet (see
+"Not yet built" below).
+
+**PropWire import (`import_propwire.py`).** A configurable field-mapping
+adapter (`config/propwire_field_map.json`, first-match-wins header
+aliases) that converts each CSV row into this pipeline's own record-dict
+shape and hands it to the exact same `persist_records()` the primary
+scraper calls -- `property_identity()`/`owner_identity()` (parcel/RE#
+first, normalized-address fallback) handle dedup automatically, so
+re-importing the same export twice never creates duplicate
+properties/owners. A row with two owner columns (Owner + Co-Owner)
+produces two ownerships on the same property, per the individual-co-owner
+rule above. **UNVALIDATED against a real PropWire export** -- no sample
+file was available when this was written; `--dump-headers` shows a real
+file's actual columns so the field map can be corrected without any code
+change. `--dry-run` persists into a throwaway in-memory database only and
+prints the campaign-eligibility breakdown, never touching `--db`.
+
+**Skip tracing (`export_skiptrace_csv()` / `import_skiptrace_results.py`).**
+Export keys each row by `owner_id` -- this pipeline's own deterministic,
+stable hash (see the module docstring's Identity model) -- as the vendor
+"Lead ID," so a returned file matches back with no name/address fuzzy
+matching involved. Only currently-blank `phone_1`/`phone_2`/`phone_3`/
+`email_1`/`email_2` fields are ever filled; an existing value is never
+overwritten, so a prior verified number, suppression flag, or outreach
+history all survive untouched. Every filled field is marked `unverified`
+in `contact_verification_json` -- skip-traced numbers are unverified until
+a human checks them, no exception. A vendor row explicitly flagged
+ambiguous (or whose Lead ID doesn't match any owner on file) is never
+guessed into place -- it's queued as a `review_ambiguous_skiptrace_match`
+research task instead (when the ID does resolve) or simply skipped and
+reported (when it doesn't). **No vendor API integration or purchase
+exists anywhere in this codebase** -- this only reads a CSV the vendor
+already returned, same "no live API configured" discipline as Phase 9's
+HubSpot export.
+
+**FSBO intake (`import_fsbo_csv.py` / `db.add_fsbo_listing()`).** Its own
+append-only `fsbo_listings` table (a capture is never overwritten by a
+later one -- a price change or status update is a new row, same
+discipline as `documents`/`evidence`), source label strictly `facebook`
+or `zillow`. Applies the same campaign geo/property-type/owner-type gate
+as every other source. A FSBO post very often doesn't name the legal
+owner at all -- when no owner name is given, no owner row is created and
+eligibility naturally comes back `review` ("No confirmed owner on file"),
+never assumed individual just because that's the common case.
+**Explicitly not built: a Facebook Marketplace or Zillow scraper** -- per
+the campaign rules, neither site is assumed to offer an accessible
+scraper API, so this is intake-only (manual entry or a hand-filled CSV).
+
+**Opening-line templates (`get_opening_line()`, `config/outreach_templates.json`).**
+The required cold-open text is used verbatim for first-touch outreach and
+**never** has the owner's name or property address inserted into it --
+those stay stored for research/matching only. Automatically switches to a
+warm `fsbo_reply` variant when explicitly replying to a listing, or a
+warm `existing_conversation` variant when the owner/property already has
+a row in `contacts`. No wording rotation exists anywhere in this
+codebase, and none is intended -- one fixed template per context, on
+purpose, same as this phase's outreach-angle text is never free-form
+generated.
+
+**Not yet built, flagged honestly rather than silently skipped:**
+- No dashboard (HTML/JS) UI for the tired-landlord list or FSBO intake
+  form yet -- CSV export and Python functions only, for now.
+- No enrichment path that fills in a missing Florida DOR use code for a
+  PropWire/FSBO property from the Duval Property Appraiser (the primary
+  scraper already knows how to do this lookup, but these standalone
+  import scripts deliberately never talk to the network, same as
+  `import_history_to_sqlite.py`/`sync_hubspot_approvals.py`) -- this means
+  a PropWire row without its own "Property Type" text label, or a FSBO
+  listing, will generally land in `review` rather than `ready_to_contact`
+  until manually confirmed or enriched some other way.
+- `import_skiptrace_results.py`'s ambiguous-match detection is a generic
+  keyword list (`low`/`uncertain`/`no match`/etc. in a confidence-style
+  column) since no specific vendor's actual result format was named --
+  adjust `AMBIGUOUS_VALUES`/`DEFAULT_HEADER_ALIASES` in that script for a
+  real vendor's exact column names and confidence vocabulary.
+
 ## Data ownership
 
 Several systems now hold overlapping pieces of the same picture. As of
@@ -483,6 +668,7 @@ this Phase 1 reconciliation, here is which one is authoritative for what:
 | Qualified/contacted leads, conversations, follow-ups, deal pipeline | HubSpot (via manual CSV import, Phase 9) | No live API/connector is configured in this environment, so there is no automatic push -- `export_hubspot_csv()` produces an import-ready file. Only records explicitly approved via the dashboard's "Approve for HubSpot" control are ever included -- never the raw scrape -- and that approval only reaches the CSV after `sync_hubspot_approvals.py` runs (see "HubSpot Export & Outreach" above). |
 | Portable backup, manual editing, recovery | CSV exports (`data/export_leads.csv`, `data/hubspot_export.csv`) and `data/backup.json` | Regenerable from SQLite at any time; `backup.json` is the one that's git-tracked and therefore the actual disaster-recovery copy. |
 | Suppression flags, notes, HubSpot-approval marks made from the dashboard | The published artifact's `db` capability (`leads/{property_id}` docs) | A convenience write surface, not a vault -- intended to be synced into the durable database on each scheduled run, not treated as the only copy. |
+| Skip-traced phone/email, campaign eligibility, tenure priority, FSBO listing history (Phase 10) | SQLite (`duval_leads_db.py`) -- `owners.phone_*`/`email_*`, `properties.campaign_eligibility`, `valuations.tenure_priority_*`, `fsbo_listings` | Same additive/backup-json-backed durability as every other Phase 1+ field. No vendor account, API key, or purchase exists anywhere in this codebase -- all of it is populated by hand-run scripts reading a file you already have. |
 
 **Known gap worth a decision:** because `records.json` is gitignored and
 this pipeline runs in ephemeral cloud containers, the accumulate-by-`doc_num`

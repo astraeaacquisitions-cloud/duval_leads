@@ -1,0 +1,12 @@
+{
+  "_comment": "Phase 10 opening call/text templates. Edit this file to change wording -- no code changes needed. cold_open is used verbatim for first-touch cold outreach: never insert the owner's name or property address into it (names/addresses stay stored for research and matching, just not spoken/written in the opener). warm_context templates are used instead when replying to a specific FSBO listing or an existing seller conversation that already has contact history on file -- see get_opening_line() in duval_leads_db.py. No automated wording rotation exists or is intended here -- one fixed template per context, on purpose.",
+
+  "cold_open": "Hello, my name is Cassi. My partners and I are buying houses in the neighborhood. Do you have any properties you are looking to sell?",
+
+  "warm_context": {
+    "fsbo_reply": "Hi, thanks for the listing -- my partners and I are buying houses in the area and wanted to reach out directly. Is it still available?",
+    "existing_conversation": "Hi again -- following up on the property we talked about. Any updates on your end?"
+  },
+
+  "compliance_note": "This is a starting point, not a script to read verbatim -- same discipline as the Phase 9 outreach angle. Preserve opt-outs and existing contact safeguards (suppression flags) before using any of these."
+}

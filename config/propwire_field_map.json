@@ -1,0 +1,36 @@
+{
+  "_comment": "Phase 10 PropWire CSV field-mapping adapter. UNVALIDATED against a real PropWire export -- no sample file was available when this was written. Each key is one of this pipeline's own record fields; each value is a list of header spellings the importer will accept (first match wins, case-insensitive, whitespace-trimmed). Send import_propwire.py --dump-headers <your.csv> to see what your actual file's headers are, and add the real spelling to the matching list below if it isn't already covered -- no code change needed.",
+
+  "owner": ["Owner Name", "Owner 1 Name", "Owner Full Name", "Owner"],
+  "owner_first_name": ["Owner 1 First Name", "Owner First Name", "First Name"],
+  "owner_last_name": ["Owner 1 Last Name", "Owner Last Name", "Last Name"],
+  "owner_type": ["Owner Type", "Entity Type", "Ownership Type"],
+  "co_owner": ["Owner 2 Name", "Owner 2 Full Name", "Co-Owner Name", "Co Owner"],
+
+  "prop_address": ["Property Address", "Situs Address", "Address"],
+  "prop_city": ["Property City", "Situs City", "City"],
+  "prop_state": ["Property State", "Situs State", "State"],
+  "prop_zip": ["Property Zip", "Property Zip Code", "Situs Zip", "Zip", "Zip Code"],
+  "situs_county": ["County", "Property County"],
+
+  "mail_address": ["Mailing Address", "Owner Mailing Address", "Mail Address"],
+  "mail_city": ["Mailing City", "Owner Mailing City", "Mail City"],
+  "mail_state": ["Mailing State", "Owner Mailing State", "Mail State"],
+  "mail_zip": ["Mailing Zip", "Mailing Zip Code", "Owner Mailing Zip", "Mail Zip"],
+
+  "re_number": ["APN", "Parcel Number", "Parcel ID", "Assessor Parcel Number", "PIN"],
+  "property_use_code": ["Land Use Code", "Property Use Code", "DOR Code"],
+  "property_type_label": ["Property Type", "Property Use Description"],
+  "year_built": ["Year Built"],
+  "building_count": ["Building Count", "Number of Buildings"],
+
+  "market_value": ["Market Value", "Total Market Value", "Assessed Total Value"],
+  "assessed_value": ["Assessed Value"],
+  "taxable_value": ["Taxable Value"],
+  "last_sale_date": ["Last Sale Date", "Sale Date"],
+  "last_sale_price": ["Last Sale Price", "Sale Price"],
+  "years_owned": ["Years Owned", "Ownership Length (Years)"],
+
+  "_dedup_comment": "Dedup uses this pipeline's own property_identity()/owner_identity() (parcel/RE# first, normalized address fallback) -- same mechanism the primary Duval Clerk scrape already uses -- so re-importing the same PropWire export twice does not create duplicate properties or owners.",
+  "_owner_type_comment": "owner_type is authoritative when the CSV supplies it directly (values like 'Individual'/'Entity'/'Trust'/'Estate' are recognized case-insensitively); otherwise classify_owner_type() falls back to name-parsing the owner/co_owner fields."
+}
