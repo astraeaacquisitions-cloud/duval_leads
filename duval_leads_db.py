@@ -160,6 +160,32 @@ CREATE TABLE IF NOT EXISTS documents (
     last_seen_at TEXT
 );
 
+-- Phase 10: FSBO intake (Facebook Marketplace / Zillow). Its own table,
+-- not `documents`, because these aren't clerk filings -- append-only
+-- listing history per property, never overwritten by a later dedup match
+-- (see import_fsbo_csv.py / add_fsbo_listing_manual()). property_id/owner_id
+-- are nullable: a listing can arrive before ownership is confirmed.
+CREATE TABLE IF NOT EXISTS fsbo_listings (
+    id TEXT PRIMARY KEY,
+    property_id TEXT,
+    owner_id TEXT,
+    source TEXT NOT NULL,
+    listing_url TEXT,
+    asking_price REAL,
+    posted_date TEXT,
+    capture_date TEXT,
+    seller_contact_method TEXT,
+    property_facts TEXT,
+    status TEXT DEFAULT 'new',
+    follow_up_date TEXT,
+    campaign_eligibility TEXT,
+    campaign_eligibility_reason TEXT,
+    raw_owner_name TEXT,
+    created_by TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -321,6 +347,7 @@ TABLES = [
     "properties", "owners", "ownerships", "documents", "evidence",
     "suppressions", "contacts", "overrides", "research_tasks",
     "hubspot_export_flags", "scrape_runs", "valuations", "scores",
+    "fsbo_listings",
 ]
 
 
@@ -368,6 +395,86 @@ def owner_identity(display_name, mailing_address, mailing_city, mailing_zip, pro
     return _hash_id("own", display_name, "DOC", doc_id), "name_only_unmerged"
 
 
+# ---------------------------------------------------------------------------
+# Owner-type classification (Phase 1 concept, extended by Phase 10). These
+# mirror duval_leads_scraper.py's own ENTITY_PATTERN/TRUST_PATTERN (this
+# module cannot import that one -- the scraper imports this module, not the
+# reverse -- so the patterns are kept here too, same duplication persist_
+# records() already had inline before this refactor pulled it out into
+# named, reusable patterns).
+# ---------------------------------------------------------------------------
+
+_ENTITY_PATTERN = re.compile(
+    r"LAND\s*TRUST|\bLLC\b|\bL\.L\.C\.?\b|\bINC\.?\b|\bCORP(?:ORATION)?\.?\b|"
+    r"\bLP\b|\bLLP\b|\bLTD\.?\b|\bCOMPANY\b|\bHOLDINGS\b|\bENTERPRISES\b|"
+    r"\bINVESTMENTS?\s*(GROUP)?\b|\bPROPERTIES\b|\bCAPITAL\b|\bVENTURES?\b",
+    re.I,
+)
+_TRUST_PATTERN = re.compile(r"\bTRUST\b", re.I)
+# Deliberately excludes "REAL ESTATE" (a business phrase, e.g. "Triten Real
+# Estate Partners") via the negative lookbehind -- only a bare "ESTATE" or
+# "DECEASED" is treated as a probate/estate signal.
+_ESTATE_PATTERN = re.compile(r"(?<!REAL\s)\bESTATE\b|\bDECEASED\b", re.I)
+
+
+def _is_entity_owned(name):
+    return bool(_ENTITY_PATTERN.search(name or ""))
+
+
+def _is_trust_owned(name):
+    return bool(_TRUST_PATTERN.search(name or ""))
+
+
+def _is_estate_owned(name):
+    return bool(_ESTATE_PATTERN.search(name or ""))
+
+
+_AUTHORITATIVE_OWNER_TYPE_MAP = {
+    "individual": "individual", "person": "individual", "natural person": "individual",
+    "individuals": "individual",
+    "entity": "entity", "business": "entity", "business entity": "entity",
+    "llc": "entity", "corporation": "entity", "corp": "entity", "company": "entity",
+    "partnership": "entity",
+    "trust": "trust",
+    "estate": "estate", "probate estate": "estate", "deceased": "estate", "deceased owner": "estate",
+}
+
+
+def classify_owner_type(display_name, authoritative_type=None):
+    """Classifies one owner into 'individual' | 'entity' | 'trust' |
+    'estate' | 'unknown', returning (owner_type, evidence, source).
+    Per Jacksonville campaign rule #2: never assumes a trustee/
+    representative named on a trust or estate is the actual individual
+    title holder -- a name that matches the trust/estate pattern is
+    classified 'trust'/'estate' regardless of what individual name also
+    appears in the string. Prefers an authoritative owner-type field from
+    the source data (e.g. a PropWire 'Owner Type' column) when given and
+    recognized; falls back to name-parsing otherwise, same patterns the
+    primary Duval Clerk pipeline already uses for entity/trust exclusion
+    and review-flagging. An unrecognized authoritative value is NOT
+    silently trusted -- it falls through to name-parsing and the
+    unrecognized value is recorded in the evidence string so the ambiguity
+    is visible rather than hidden."""
+    name = (display_name or "").strip()
+    if authoritative_type:
+        mapped = _AUTHORITATIVE_OWNER_TYPE_MAP.get(authoritative_type.strip().lower())
+        if mapped:
+            return mapped, f"authoritative field value {authoritative_type!r}", "authoritative_field"
+    if not name:
+        return "unknown", "no owner name on file", "unknown"
+    if _is_entity_owned(name):
+        return "entity", f"name matches entity pattern: {name!r}", "name_pattern"
+    if _is_estate_owned(name):
+        return "estate", f"name matches probate/estate pattern: {name!r}", "name_pattern"
+    if _is_trust_owned(name):
+        return "trust", f"name matches trust pattern: {name!r}", "name_pattern"
+    if authoritative_type:
+        return ("individual", f"unrecognized authoritative field value {authoritative_type!r}; "
+                               f"name {name!r} matched no entity/trust/estate pattern -- treated as "
+                               f"individual but flagged ambiguous for the field value", "name_pattern_ambiguous_field")
+    return "individual", f"no entity/trust/estate pattern matched: {name!r}", "name_pattern"
+
+
 # Columns added to a table AFTER its original CREATE TABLE. "CREATE TABLE
 # IF NOT EXISTS" is a no-op on a table that already exists -- it does NOT
 # add new columns -- so a database file created before one of these was
@@ -398,6 +505,32 @@ SCHEMA_MIGRATIONS = [
     ("scores", "urgency_reason", "TEXT"),
     ("scores", "confidence_reason", "TEXT"),
     ("scores", "outreach_angle", "TEXT"),
+    # Phase 10: owner classification (individual/entity/trust/estate/mixed/
+    # unknown -- see classify_owner_type()) and skip-trace contact fields.
+    ("owners", "owner_type_evidence", "TEXT"),
+    ("owners", "owner_type_source", "TEXT"),
+    ("owners", "is_estate", "INTEGER DEFAULT 0"),
+    ("owners", "phone_1", "TEXT"),
+    ("owners", "phone_2", "TEXT"),
+    ("owners", "phone_3", "TEXT"),
+    ("owners", "email_1", "TEXT"),
+    ("owners", "email_2", "TEXT"),
+    ("owners", "contact_verification_json", "TEXT"),
+    ("owners", "additional_contacts_json", "TEXT"),
+    ("owners", "skip_trace_source", "TEXT"),
+    ("owners", "skip_trace_vendor", "TEXT"),
+    ("owners", "skip_traced_at", "TEXT"),
+    # Phase 10: campaign geo/property-type/owner-type eligibility and lead
+    # provenance (default NULL/'duval_clerk' backfill handled in code, not
+    # a migration default, since existing rows predate the concept).
+    ("properties", "lead_source", "TEXT"),
+    ("properties", "campaign_eligibility", "TEXT"),
+    ("properties", "campaign_eligibility_reason", "TEXT"),
+    # Phase 10: tired-landlord tenure priority, separate from Dealability/
+    # Contact Priority -- see compute_tenure_priority().
+    ("valuations", "tenure_priority_score", "INTEGER"),
+    ("valuations", "tenure_priority_reason", "TEXT"),
+    ("valuations", "tenure_ambiguous_transfer", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -494,7 +627,7 @@ def _doc_id(source, doc_num, doc_type):
 
 def _upsert_property(conn, ts, re_number, situs_address, situs_city, situs_state, situs_zip,
                       property_use_code="", property_type_label="", property_type_decision="",
-                      year_built=None, building_count=None):
+                      year_built=None, building_count=None, lead_source="duval_clerk"):
     prop_id, confidence = property_identity(re_number, situs_address, situs_city, situs_zip)
     if not prop_id:
         return None, "unmatched"
@@ -510,20 +643,27 @@ def _upsert_property(conn, ts, re_number, situs_address, situs_city, situs_state
             "property_use_code=COALESCE(NULLIF(?,''), property_use_code), "
             "property_type_label=COALESCE(NULLIF(?,''), property_type_label), "
             "property_type_decision=COALESCE(NULLIF(?,''), property_type_decision), "
-            "year_built=COALESCE(?, year_built), building_count=COALESCE(?, building_count) "
+            "year_built=COALESCE(?, year_built), building_count=COALESCE(?, building_count), "
+            # First-source wins: a property's lead_source records how it was
+            # FIRST discovered by this pipeline, so a later run from a
+            # different source (e.g. the same address later shows up in a
+            # PropWire pull) doesn't overwrite that provenance.
+            "lead_source=COALESCE(NULLIF(lead_source,''), ?) "
             "WHERE id=?",
             (re_number, situs_address, situs_city, situs_state, situs_zip, confidence, ts,
              property_use_code, property_type_label, property_type_decision,
-             year_built, building_count, prop_id),
+             year_built, building_count, lead_source, prop_id),
         )
     else:
         conn.execute(
             "INSERT INTO properties (id, re_number, situs_address, situs_city, situs_state, "
             "situs_zip, address_match_confidence, first_seen_at, last_seen_at, "
-            "property_use_code, property_type_label, property_type_decision, year_built, building_count) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "property_use_code, property_type_label, property_type_decision, year_built, building_count, "
+            "lead_source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (prop_id, re_number, situs_address, situs_city, situs_state, situs_zip, confidence, ts, ts,
-             property_use_code, property_type_label, property_type_decision, year_built, building_count),
+             property_use_code, property_type_label, property_type_decision, year_built, building_count,
+             lead_source),
         )
     return prop_id, confidence
 
@@ -564,30 +704,50 @@ def _upsert_valuation_raw(conn, ts, property_id, market_value, assessed_value, t
 
 
 def _upsert_owner(conn, ts, display_name, mailing_address, mailing_city, mailing_state,
-                   mailing_zip, is_entity, is_trust, property_id, doc_id):
+                   mailing_zip, owner_type, owner_type_evidence, owner_type_source,
+                   property_id, doc_id):
+    """owner_type/_evidence/_source come from classify_owner_type() (Phase
+    10) -- always call that first rather than re-deriving is_entity/is_trust/
+    is_estate inline, so every caller (the Duval Clerk pipeline, the
+    PropWire/FSBO importers) shares one classification path."""
     owner_id, confidence = owner_identity(display_name, mailing_address, mailing_city,
                                            mailing_zip, property_id, doc_id)
     if not owner_id:
         return None, "unmatched"
-    row = conn.execute("SELECT id FROM owners WHERE id=?", (owner_id,)).fetchone()
+    is_entity = int(owner_type == "entity")
+    is_trust = int(owner_type == "trust")
+    is_estate = int(owner_type == "estate")
+    row = conn.execute("SELECT id, owner_type FROM owners WHERE id=?", (owner_id,)).fetchone()
     if row:
+        # A confirmed entity/trust/estate classification is sticky -- once
+        # evidenced, a later record for the same owner_id that happens to
+        # be formatted differently (or missing the identifying word) never
+        # silently downgrades it back to individual/unknown.
+        existing_type = row["owner_type"] or "unknown"
+        merged_type = existing_type if existing_type in ("entity", "trust", "estate") else owner_type
         conn.execute(
             "UPDATE owners SET mailing_address=COALESCE(NULLIF(?,''), mailing_address), "
             "mailing_city=COALESCE(NULLIF(?,''), mailing_city), "
             "mailing_state=COALESCE(NULLIF(?,''), mailing_state), "
             "mailing_zip=COALESCE(NULLIF(?,''), mailing_zip), "
-            "is_entity=?, is_trust=CASE WHEN ? THEN 1 ELSE is_trust END, "
+            "owner_type=?, owner_type_evidence=?, owner_type_source=?, "
+            "is_entity=CASE WHEN owner_type IN ('entity','trust','estate') THEN is_entity ELSE ? END, "
+            "is_trust=CASE WHEN ? THEN 1 ELSE is_trust END, "
+            "is_estate=CASE WHEN ? THEN 1 ELSE is_estate END, "
             "identity_confidence=?, last_seen_at=? WHERE id=?",
             (mailing_address, mailing_city, mailing_state, mailing_zip,
-             int(is_entity), int(is_trust), confidence, ts, owner_id),
+             merged_type, owner_type_evidence, owner_type_source, is_entity, is_trust, is_estate,
+             confidence, ts, owner_id),
         )
     else:
         conn.execute(
-            "INSERT INTO owners (id, display_name, owner_type, mailing_address, mailing_city, "
-            "mailing_state, mailing_zip, is_entity, is_trust, identity_confidence, first_seen_at, last_seen_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (owner_id, display_name, "entity" if is_entity else "unknown", mailing_address,
-             mailing_city, mailing_state, mailing_zip, int(is_entity), int(is_trust), confidence, ts, ts),
+            "INSERT INTO owners (id, display_name, owner_type, owner_type_evidence, owner_type_source, "
+            "mailing_address, mailing_city, mailing_state, mailing_zip, is_entity, is_trust, is_estate, "
+            "identity_confidence, first_seen_at, last_seen_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (owner_id, display_name, owner_type, owner_type_evidence, owner_type_source,
+             mailing_address, mailing_city, mailing_state, mailing_zip,
+             is_entity, is_trust, is_estate, confidence, ts, ts),
         )
     return owner_id, confidence
 
@@ -607,25 +767,30 @@ def persist_records(conn, records, run_id, source_note=""):
         doc_id = _doc_id(source, doc_num, doc_type)
 
         owner_name = r.get("owner", "") or ""
-        # LAND TRUST counts as entity-like (investors use it like an LLC to
-        # hold title anonymously); a bare "<Name> Trust" does not -- that's
-        # very often an individual's living/family/revocable estate plan,
-        # a legitimate seller, not an entity to exclude. See
-        # TRUST_OWNERSHIP_REVIEW_REQUIRED in the scraper's compute_score_flags
-        # for why trust ownership is flagged for authority verification
-        # rather than filtered out.
-        is_entity = bool(re.search(
-            r"LAND\s*TRUST|\bLLC\b|\bINC\b|\bCORP|\bLP\b|\bLLP\b|\bLTD\b|\bCOMPANY\b|"
-            r"\bHOLDINGS\b|\bENTERPRISES\b|\bINVESTMENTS?\b|\bPROPERTIES\b|\bCAPITAL\b|\bVENTURES?\b",
-            owner_name, re.I,
-        ))
-        is_trust = bool(re.search(r"\bTRUST\b", owner_name, re.I))
+        # Phase 1 classified entity vs. trust inline here; Phase 10 pulled
+        # that out into classify_owner_type() (shared with the PropWire/
+        # FSBO importers) and added 'estate' as a third non-individual
+        # category -- LAND TRUST still counts as entity-like (investors use
+        # it like an LLC to hold title anonymously); a bare "<Name> Trust"
+        # does not -- that's very often an individual's living/family/
+        # revocable estate plan, a legitimate seller, not an entity to
+        # exclude. See TRUST_OWNERSHIP_REVIEW_REQUIRED in the scraper's
+        # compute_score_flags for why trust ownership is flagged for
+        # authority verification rather than filtered out; estate ownership
+        # gets the same review-required treatment (PROBATE_REPRESENTATIVE_
+        # REVIEW_REQUIRED is set on the record itself when the source is a
+        # Probate Document -- classify_owner_type catches the broader case
+        # of an "X Estate"-style owner name on ANY document category).
+        owner_type, owner_type_evidence, owner_type_source = classify_owner_type(
+            owner_name, r.get("owner_type")
+        )
 
         prop_id, prop_conf = _upsert_property(
             conn, ts, r.get("re_number", ""), r.get("prop_address", ""),
             r.get("prop_city", ""), r.get("prop_state", ""), r.get("prop_zip", ""),
             r.get("property_use_code", ""), r.get("property_type_label", ""),
             r.get("property_type_decision", ""), r.get("year_built"), r.get("building_count"),
+            lead_source=r.get("lead_source") or "duval_clerk",
         )
         if prop_id:
             _upsert_valuation_raw(
@@ -635,7 +800,8 @@ def persist_records(conn, records, run_id, source_note=""):
             )
         owner_id, owner_conf = _upsert_owner(
             conn, ts, r.get("owner", ""), r.get("mail_address", ""), r.get("mail_city", ""),
-            r.get("mail_state", ""), r.get("mail_zip", ""), is_entity, is_trust, prop_id, doc_id,
+            r.get("mail_state", ""), r.get("mail_zip", ""),
+            owner_type, owner_type_evidence, owner_type_source, prop_id, doc_id,
         )
 
         if prop_id and owner_id:
@@ -683,7 +849,7 @@ def persist_records(conn, records, run_id, source_note=""):
                 priority="normal",
             )
 
-        if is_trust and owner_id:
+        if owner_type == "trust" and owner_id:
             # A trust on title is a legitimate lead, not proof anyone we can
             # reach has authority to sell -- never assume a trustee,
             # beneficiary, relative, or occupant does.
@@ -691,6 +857,20 @@ def persist_records(conn, records, run_id, source_note=""):
                 conn, "verify_trust_authority", property_id=prop_id, owner_id=owner_id,
                 description=f"TRUST_OWNERSHIP_REVIEW_REQUIRED: confirm trustee identity and authority "
                              f"to sell for {owner_name!r} before treating any contact as decision-maker.",
+                priority="normal",
+            )
+
+        if owner_type == "estate" and owner_id and r.get("cat") != "probate":
+            # Same discipline, for an estate-named owner surfaced by a
+            # non-probate document (e.g. a lien or judgment against "X
+            # Estate") -- the cat=='probate' case already gets
+            # verify_probate_representative below with its own DirectName
+            # framing, so this only covers the broader case that catches.
+            _add_research_task_if_absent(
+                conn, "verify_estate_representative", property_id=prop_id, owner_id=owner_id,
+                description=f"Owner {owner_name!r} reads as a probate/estate name -- identify the actual "
+                             f"personal representative with authority to sell before treating any contact "
+                             f"as decision-maker.",
                 priority="normal",
             )
 
@@ -1260,9 +1440,13 @@ def compute_dealability_score(conn, property_id, config=None):
         lien_desc = f"{active_lien_count} active distress records -- heavily encumbered"
     reasons.append(f"Liens: {lien_points}/{mp.get('manageable_liens',10)} -- {lien_desc} (mortgage balance unknown -- see research queue).")
 
-    # -- Ownership clarity: from Phase 1's identity confidence + trust/entity flags --
+    # -- Ownership clarity: from Phase 1's identity confidence + trust/entity
+    # flags, extended in Phase 10 to also catch estate ownership (a named
+    # party is conventionally the decedent -- never assume a relative,
+    # heir, or occupant has authority to sell without confirming the actual
+    # personal representative, same discipline as trust ownership) --
     owners = conn.execute(
-        "SELECT o.is_entity, o.is_trust, o.identity_confidence FROM ownerships ow "
+        "SELECT o.is_entity, o.is_trust, o.is_estate, o.identity_confidence FROM ownerships ow "
         "JOIN owners o ON o.id = ow.owner_id WHERE ow.property_id=?", (property_id,)
     ).fetchall()
     oc = config.get("ownership_clarity", {})
@@ -1271,11 +1455,15 @@ def compute_dealability_score(conn, property_id, config=None):
         owner_desc = "no confirmed owner on file"
     else:
         any_trust = any(o["is_trust"] for o in owners)
+        any_estate = any(o["is_estate"] for o in owners)
         any_entity = any(o["is_entity"] for o in owners)
         best_conf = any(o["identity_confidence"] in ("verified_parcel", "name_and_mailing_address") for o in owners)
         if any_trust:
             owner_points = oc.get("trust_review_required_points", 6)
             owner_desc = "trust ownership -- trustee authority not yet verified"
+        elif any_estate:
+            owner_points = oc.get("trust_review_required_points", 6)
+            owner_desc = "probate/estate ownership -- personal representative authority not yet verified"
         elif any_entity:
             owner_points = oc.get("entity_owned_points", 8)
             owner_desc = "entity-held title"
@@ -1474,8 +1662,8 @@ def compute_confidence_score(conn, property_id, config=None):
         "SELECT address_match_confidence FROM properties WHERE id=?", (property_id,)
     ).fetchone()
     owners = conn.execute(
-        "SELECT o.identity_confidence FROM ownerships ow JOIN owners o ON o.id = ow.owner_id "
-        "WHERE ow.property_id=?", (property_id,)
+        "SELECT o.identity_confidence, o.is_trust, o.is_estate FROM ownerships ow "
+        "JOIN owners o ON o.id = ow.owner_id WHERE ow.property_id=?", (property_id,)
     ).fetchall()
     val = conn.execute("SELECT pao_market_value FROM valuations WHERE property_id=?", (property_id,)).fetchone()
     flags_rows = conn.execute(
@@ -1487,6 +1675,16 @@ def compute_confidence_score(conn, property_id, config=None):
             all_flags.update(json.loads(fr["flags_json"] or "[]"))
         except (ValueError, TypeError):
             pass
+    # Phase 10: an owner classified trust/estate is a review-required fact
+    # regardless of which document category surfaced the property (the
+    # scraper only sets TRUST_OWNERSHIP_REVIEW_REQUIRED/PROBATE_
+    # REPRESENTATIVE_REVIEW_REQUIRED on trust filings and Probate Documents
+    # specifically -- an estate-named owner on an ordinary lien or judgment
+    # wouldn't otherwise be caught here).
+    if any(o["is_trust"] for o in owners):
+        all_flags.add("TRUST_OWNERSHIP_REVIEW_REQUIRED")
+    if any(o["is_estate"] for o in owners):
+        all_flags.add("PROBATE_REPRESENTATIVE_REVIEW_REQUIRED")
 
     addr_pts = cc.get("address_match_points", {}).get(
         prop["address_match_confidence"] if prop else "unmatched", 0
@@ -1606,6 +1804,17 @@ def compute_outreach_angle(conn, property_id, tier, config=None):
             all_flags.update(json.loads(fr["flags_json"] or "[]"))
         except (ValueError, TypeError):
             pass
+    # Phase 10: same owner-level backstop as compute_confidence_score --
+    # an estate-named owner on a non-probate document category still needs
+    # the review-required prefix leading the angle.
+    owner_flags = conn.execute(
+        "SELECT o.is_trust, o.is_estate FROM ownerships ow JOIN owners o ON o.id = ow.owner_id "
+        "WHERE ow.property_id=?", (property_id,)
+    ).fetchall()
+    if any(o["is_trust"] for o in owner_flags):
+        all_flags.add("TRUST_OWNERSHIP_REVIEW_REQUIRED")
+    if any(o["is_estate"] for o in owner_flags):
+        all_flags.add("PROBATE_REPRESENTATIVE_REVIEW_REQUIRED")
 
     parts = []
     if all_flags & {"TRUST_OWNERSHIP_REVIEW_REQUIRED", "PROBATE_REPRESENTATIVE_REVIEW_REQUIRED"}:
@@ -1629,6 +1838,490 @@ def compute_outreach_angle(conn, property_id, tier, config=None):
     return " ".join(p for p in parts if p)
 
 
+# ---------------------------------------------------------------------------
+# Phase 10: Jacksonville/Duval campaign rules -- geo/property-type/owner-
+# type eligibility gate for the active campaign, tired-landlord tenure
+# priority, and the opening-line lookup. Config-driven via
+# config/campaign.json and config/outreach_templates.json -- edit those to
+# retune, no code changes needed. Eligibility/tenure are informational
+# fields layered on top of the existing pipeline -- they never delete a
+# property/owner row, never override Phase 2's own property_type_decision,
+# and never touch a lead from outside the active campaign's own
+# bookkeeping (there is no "other market" data in this pipeline today, but
+# nothing here assumes there never will be).
+# ---------------------------------------------------------------------------
+
+CAMPAIGN_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "campaign.json"
+)
+
+
+def load_campaign_config(path=CAMPAIGN_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+CAMPAIGN_CONFIG = load_campaign_config()
+
+OUTREACH_TEMPLATES_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "outreach_templates.json"
+)
+
+
+def load_outreach_templates_config(path=OUTREACH_TEMPLATES_CONFIG_PATH):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+OUTREACH_TEMPLATES_CONFIG = load_outreach_templates_config()
+
+
+def is_in_campaign_geo_fence(situs_county, situs_zip, config=None):
+    """Returns (in_fence, reason). Checks real geographic fields: an
+    explicit county value first (authoritative when the source provides
+    one, e.g. PropWire's own County column), the curated ZIP list second
+    (best-effort fallback -- see config/campaign.json's _zip_known_gap).
+    Never matches on the city name 'Jacksonville' as a text substring --
+    several incorporated Duval-adjacent beach towns (Atlantic Beach,
+    Neptune Beach, Baldwin) don't contain that word at all, and the city
+    name 'Jacksonville' exists outside Florida too."""
+    config = config if config is not None else CAMPAIGN_CONFIG
+    geo = config.get("active_campaign", {}).get("geo_fence", {})
+    county = (situs_county or "").strip()
+    if county:
+        allowed = {v.lower() for v in geo.get("county_field_values", [])}
+        if county.lower() in allowed:
+            return True, f"county field matches: {county!r}"
+        return False, f"county field does not match the campaign county: {county!r}"
+    zip5 = re.sub(r"[^0-9]", "", situs_zip or "")[:5]
+    if not zip5:
+        return False, "no county field and no ZIP on file -- cannot confirm campaign geography"
+    if zip5 in set(geo.get("zip_codes", [])):
+        return True, f"ZIP {zip5} matches the campaign ZIP fallback list (no county field on file)"
+    return False, f"ZIP {zip5} is not on the campaign ZIP fallback list (no county field on file)"
+
+
+def compute_campaign_eligibility(conn, property_id, config=None):
+    """Returns (eligibility, reason). eligibility is one of
+    'ready_to_contact' | 'review' | 'out_of_market' | 'excluded_entity' |
+    'excluded_property_type'. Individual co-owners are allowed (any
+    number); a trust, estate, unknown, or mixed individual/entity
+    ownership always goes to 'review', never assumed either way -- see
+    classify_owner_type()'s module note on never treating a named
+    trustee/representative as the actual individual title holder."""
+    config = config if config is not None else CAMPAIGN_CONFIG
+    campaign = config.get("active_campaign", {})
+    prop = conn.execute(
+        "SELECT situs_zip, property_use_code FROM properties WHERE id=?", (property_id,)
+    ).fetchone()
+    if not prop:
+        return "review", "Property not found on file."
+
+    in_fence, geo_reason = is_in_campaign_geo_fence(None, prop["situs_zip"], config)
+    if not in_fence:
+        market = campaign.get("market_label", "the active campaign market")
+        return "out_of_market", f"Outside {market} -- {geo_reason}."
+
+    prefix = (prop["property_use_code"] or "")[:2]
+    allowed_prefixes = set(campaign.get("property_type_prefixes", []))
+    if not prefix:
+        # No DOR use code on file at all (e.g. a PropWire/FSBO row that
+        # doesn't carry Duval's own PAO code) -- same discipline as Phase
+        # 2's own classify_property_type(): missing data is never silently
+        # excluded OR silently included, it goes to review.
+        return "review", "No property-use code on file -- can't yet confirm this is single-family for the campaign."
+    if allowed_prefixes and prefix not in allowed_prefixes:
+        return "excluded_property_type", (
+            f"Property-use prefix {prefix!r} is outside this campaign's single-family focus "
+            f"(campaign_eligibility only -- Phase 2's own property_type_decision on this property is unchanged)."
+        )
+
+    owners = conn.execute(
+        "SELECT o.owner_type FROM ownerships ow JOIN owners o ON o.id = ow.owner_id "
+        "WHERE ow.property_id=? AND ow.is_current=1", (property_id,)
+    ).fetchall()
+    types = {(o["owner_type"] or "unknown") for o in owners}
+    if not types:
+        return "review", "No confirmed owner on file -- ownership type unknown."
+    if types == {"individual"}:
+        n = len(owners)
+        co = f" ({n} individual co-owners)" if n > 1 else ""
+        return "ready_to_contact", f"Confirmed individual owner{co}, within campaign geography and property type."
+    if types == {"entity"}:
+        return "excluded_entity", "All current owners are business entities (LLC/corp/etc.) -- excluded per campaign rule #2."
+    if "trust" in types:
+        return "review", "Trust ownership on file -- trustee authority not yet verified before this lead can be contacted."
+    if "estate" in types:
+        return "review", "Probate/estate ownership on file -- personal representative authority not yet verified."
+    if "unknown" in types:
+        return "review", "At least one current owner's type could not be confirmed (individual vs. entity) -- needs manual classification."
+    return "review", "Mixed individual/entity ownership on file -- needs manual review before contact."
+
+
+def compute_tenure_priority(conn, property_id, config=None):
+    """Returns (tenure_priority_score or None, reason, tenure_years or
+    None, ambiguous_transfer flag as 0/1). A separate, explainable signal
+    from Dealability/Contact Priority -- long tenure alone doesn't prove
+    fatigue, distress, equity, or willingness to sell, it's just what this
+    function measures.
+
+    Tenure is computed DYNAMICALLY against today's date from the latest
+    recorded transfer (valuations.last_sale_date) -- never the property's
+    construction year (year_built measures the structure's age, not who's
+    owned it or for how long). A transfer at or below the same nominal-
+    sale-price floor Phase 3's equity signal already uses
+    (config/dealability_weights.json's equity.nominal_sale_price_floor) is
+    flagged ambiguous rather than trusted as establishing a new beneficial
+    owner -- e.g. a $10 quitclaim into a family member's name is
+    administrative/related-party, not necessarily a new arm's-length
+    owner. Missing last_sale_date stays unknown, never assumed either
+    way. Absentee mailing address (already computed in Phase 7) is folded
+    in as a labeled PROXY for non-owner-occupancy, never asserted as
+    confirmed rental status -- there is no rental-registration or lease
+    data source in this pipeline (see README's Phase 10 known gap)."""
+    config = config if config is not None else CAMPAIGN_CONFIG
+    min_years = config.get("active_campaign", {}).get("tired_landlord_min_years", 20)
+
+    val = conn.execute(
+        "SELECT last_sale_date, last_sale_price, absentee_stage FROM valuations WHERE property_id=?",
+        (property_id,),
+    ).fetchone()
+    if not val or not val["last_sale_date"]:
+        return None, "No recorded acquisition date on file -- tenure unknown.", None, 0
+
+    try:
+        sale_date = datetime.datetime.strptime(str(val["last_sale_date"])[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return (None, f"Recorded acquisition date {val['last_sale_date']!r} could not be parsed -- tenure unknown.",
+                None, 0)
+
+    tenure_years = (datetime.date.today() - sale_date).days // 365
+
+    nominal_floor = DEALABILITY_CONFIG.get("equity", {}).get("nominal_sale_price_floor", 1000)
+    last_sale_price = val["last_sale_price"]
+    ambiguous = bool(last_sale_price is not None and last_sale_price < nominal_floor)
+
+    if tenure_years < min_years:
+        reason = (f"Owned {tenure_years} years (since {sale_date.isoformat()}) -- below the {min_years}-year "
+                   f"tired-landlord threshold.")
+        return None, reason, tenure_years, int(ambiguous)
+
+    absentee_bonus = 0
+    absentee_note = ""
+    if val["absentee_stage"] in ("ABSENTEE_STAGE_LOCAL_ABSENTEE", "ABSENTEE_STAGE_OUT_OF_STATE"):
+        absentee_bonus = 10
+        absentee_note = (" Mailing address is absentee (proxy signal for non-owner-occupancy, "
+                          "NOT confirmed rental status -- no lease/rental-registration data source exists here).")
+
+    score = min(100, 60 + min((tenure_years - min_years) * 2, 30) + absentee_bonus)
+    if ambiguous:
+        reason = (
+            f"Owned {tenure_years} years per the last recorded transfer ({sale_date.isoformat()}), which "
+            f"clears the {min_years}-year threshold, but that transfer was at a nominal price "
+            f"(${last_sale_price:,.0f}) -- likely administrative, corrective, or a related-party transfer "
+            f"rather than an arm's-length sale, so verified BENEFICIAL-owner tenure is uncertain, not "
+            f"confirmed.{absentee_note}"
+        )
+    else:
+        reason = (f"Owned {tenure_years} years (since {sale_date.isoformat()}) -- meets the {min_years}-year "
+                   f"tired-landlord threshold.{absentee_note}")
+    return score, reason, tenure_years, int(ambiguous)
+
+
+def get_opening_line(conn, owner_id=None, property_id=None, fsbo_reply=False, config=None):
+    """Returns the opening call/text line. NEVER inserts the owner's name
+    or property address -- those stay stored for research/matching only,
+    per Jacksonville campaign rule #6. Uses the warm fsbo_reply template
+    when explicitly replying to a specific FSBO listing (fsbo_reply=True),
+    the warm existing_conversation template when this owner/property
+    already has contact history logged in `contacts`, or the fixed
+    cold_open template otherwise. No wording rotation -- one fixed
+    template per context, on purpose."""
+    config = config if config is not None else OUTREACH_TEMPLATES_CONFIG
+    if fsbo_reply:
+        return config.get("warm_context", {}).get("fsbo_reply") or config.get("cold_open", "")
+    if owner_id or property_id:
+        conditions, params = [], []
+        if owner_id:
+            conditions.append("owner_id=?")
+            params.append(owner_id)
+        if property_id:
+            conditions.append("property_id=?")
+            params.append(property_id)
+        row = conn.execute(
+            f"SELECT COUNT(*) c FROM contacts WHERE {' OR '.join(conditions)}", params
+        ).fetchone()
+        if row and row["c"] > 0:
+            return config.get("warm_context", {}).get("existing_conversation") or config.get("cold_open", "")
+    return config.get("cold_open", "")
+
+
+def export_tired_landlord_csv(conn, path, config=None):
+    """Every property with a computed tenure_priority_score, sorted
+    highest first, joined with the existing Dealability/Contact Priority
+    context so the list is explainable rather than a bare ranking.
+    Excludes anything the campaign gate marked excluded_entity/
+    excluded_property_type/out_of_market -- a tenure-priority ranking of
+    leads outside this campaign's scope isn't a call list. Review-required
+    leads (trust/estate/mixed/unknown ownership) ARE included, clearly
+    labeled, since they're still real tired-landlord candidates once
+    ownership is confirmed -- just not ready to dial yet."""
+    rows = conn.execute(
+        "SELECT p.id, p.situs_address, p.situs_city, p.situs_state, p.situs_zip, "
+        "p.campaign_eligibility, p.campaign_eligibility_reason, "
+        "v.tenure_priority_score, v.tenure_priority_reason, v.tenure_ambiguous_transfer, "
+        "v.absentee_stage, sc.dealability_score, sc.contact_priority_score, sc.tier "
+        "FROM properties p JOIN valuations v ON v.property_id = p.id "
+        "LEFT JOIN (SELECT s1.* FROM scores s1 INNER JOIN "
+        " (SELECT property_id, MAX(computed_at) AS max_ts FROM scores GROUP BY property_id) latest "
+        " ON s1.property_id = latest.property_id AND s1.computed_at = latest.max_ts) sc "
+        " ON sc.property_id = p.id "
+        "WHERE v.tenure_priority_score IS NOT NULL "
+        "AND p.campaign_eligibility NOT IN ('excluded_entity', 'excluded_property_type', 'out_of_market') "
+        "ORDER BY v.tenure_priority_score DESC"
+    ).fetchall()
+    cols = ["Property Address", "City", "State", "Zip", "Campaign Eligibility", "Eligibility Reason",
+            "Tenure Priority Score", "Tenure Priority Reason", "Ambiguous Transfer", "Absentee Stage",
+            "Dealability Score", "Contact Priority Score", "Tier", "Property ID"]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([
+                r["situs_address"] or "", r["situs_city"] or "", r["situs_state"] or "", r["situs_zip"] or "",
+                r["campaign_eligibility"] or "", r["campaign_eligibility_reason"] or "",
+                r["tenure_priority_score"], r["tenure_priority_reason"] or "",
+                "yes" if r["tenure_ambiguous_transfer"] else "no", r["absentee_stage"] or "",
+                r["dealability_score"] if r["dealability_score"] is not None else "",
+                r["contact_priority_score"] if r["contact_priority_score"] is not None else "",
+                r["tier"] or "", r["id"],
+            ])
+    return len(rows)
+
+
+def export_skiptrace_csv(conn, path, include_all=False):
+    """One row per CURRENT owner needing skip tracing, keyed by owner_id
+    (this pipeline's own deterministic, stable hash -- see the module
+    docstring's Identity model -- so a vendor's returned file can be
+    matched back with no ambiguity about which owner a row belongs to).
+    By default only exports owners with no phone_1 on file yet (so
+    re-running this doesn't keep re-sending leads already traced);
+    include_all=True exports every current owner regardless. Suppressed
+    properties are excluded -- no point paying to trace a lead you've
+    already decided to pass on."""
+    where_extra = "" if include_all else "AND (o.phone_1 IS NULL OR o.phone_1 = '')"
+    rows = conn.execute(
+        f"SELECT DISTINCT o.id AS owner_id, o.display_name, o.owner_type, "
+        f"p.id AS property_id, p.situs_address, p.situs_city, p.situs_state, p.situs_zip, "
+        f"o.mailing_address, o.mailing_city, o.mailing_state, o.mailing_zip "
+        f"FROM owners o JOIN ownerships ow ON ow.owner_id = o.id AND ow.is_current = 1 "
+        f"JOIN properties p ON p.id = ow.property_id "
+        f"WHERE p.id NOT IN (SELECT entity_id FROM suppressions WHERE entity_type='property') "
+        f"{where_extra} ORDER BY p.situs_address"
+    ).fetchall()
+    cols = ["Lead ID", "Owner Name", "Owner Type", "Property Address", "Property City",
+            "Property State", "Property Zip", "Mailing Address", "Mailing City",
+            "Mailing State", "Mailing Zip", "Property ID"]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([
+                r["owner_id"], r["display_name"] or "", r["owner_type"] or "",
+                r["situs_address"] or "", r["situs_city"] or "", r["situs_state"] or "", r["situs_zip"] or "",
+                r["mailing_address"] or "", r["mailing_city"] or "", r["mailing_state"] or "", r["mailing_zip"] or "",
+                r["property_id"],
+            ])
+    return len(rows)
+
+
+def apply_skiptrace_results(conn, results, vendor="", source=""):
+    """results is a list of dicts, each with at least 'lead_id' (the
+    owner_id from export_skiptrace_csv) and any of phone_1/phone_2/
+    phone_3/email_1/email_2/additional_contacts/ambiguous. Returns
+    (n_applied, n_ambiguous, unmatched_lead_ids).
+
+    Only fills currently-BLANK phone/email fields -- an existing value
+    (however it got there) is never overwritten, so a previously-verified
+    number survives a re-trace. Every field this function fills is marked
+    'unverified' in contact_verification_json -- skip-traced numbers are
+    unverified until a human checks them, no exception. A row explicitly
+    marked ambiguous (or whose lead_id doesn't match a known owner) is
+    never guessed into place: it's counted separately and, when it does
+    match a real owner, queued as a research task instead of applied."""
+    n_applied = 0
+    n_ambiguous = 0
+    unmatched = []
+    for r in results:
+        lead_id = (r.get("lead_id") or "").strip()
+        if not lead_id:
+            continue
+        owner = conn.execute(
+            "SELECT id, phone_1, phone_2, phone_3, email_1, email_2, contact_verification_json, "
+            "additional_contacts_json FROM owners WHERE id=?", (lead_id,)
+        ).fetchone()
+        if not owner:
+            unmatched.append(lead_id)
+            continue
+        if r.get("ambiguous"):
+            n_ambiguous += 1
+            _add_research_task_if_absent(
+                conn, "review_ambiguous_skiptrace_match", owner_id=lead_id,
+                description=f"Skip-trace vendor result for owner {lead_id} flagged ambiguous -- "
+                             f"review before adding any phone/email.",
+                priority="normal",
+            )
+            continue
+
+        verification = {}
+        try:
+            verification = json.loads(owner["contact_verification_json"] or "{}")
+        except (ValueError, TypeError):
+            verification = {}
+
+        updates = {}
+        for field in ("phone_1", "phone_2", "phone_3", "email_1", "email_2"):
+            new_value = (r.get(field) or "").strip()
+            if new_value and not (owner[field] or "").strip():
+                updates[field] = new_value
+                verification[field] = "unverified"
+
+        if not updates and not r.get("additional_contacts"):
+            continue
+
+        additional_json = owner["additional_contacts_json"]
+        extra = r.get("additional_contacts")
+        if extra:
+            try:
+                existing_extra = json.loads(additional_json or "[]")
+            except (ValueError, TypeError):
+                existing_extra = []
+            additional_json = json.dumps(existing_extra + list(extra))
+
+        set_clauses = ", ".join(f"{f}=?" for f in updates) + (", " if updates else "")
+        conn.execute(
+            f"UPDATE owners SET {set_clauses}"
+            "contact_verification_json=?, additional_contacts_json=?, "
+            "skip_trace_source=COALESCE(NULLIF(?,''), skip_trace_source), "
+            "skip_trace_vendor=COALESCE(NULLIF(?,''), skip_trace_vendor), "
+            "skip_traced_at=? WHERE id=?",
+            (*updates.values(), json.dumps(verification), additional_json,
+             source, vendor, now_iso(), lead_id),
+        )
+        n_applied += 1
+    conn.commit()
+    return n_applied, n_ambiguous, unmatched
+
+
+FSBO_VALID_SOURCES = {"facebook", "zillow"}
+
+
+def add_fsbo_listing(conn, source, prop_address, prop_city="", prop_state="FL", prop_zip="",
+                      owner_name="", listing_url="", asking_price=None, posted_date=None,
+                      seller_contact_method="", property_facts="", follow_up_date=None,
+                      created_by="", capture_date=None):
+    """Records one FSBO listing (Facebook Marketplace or Zillow -- source
+    must be 'facebook' or 'zillow', a separate label per source, never
+    blended). Always inserts a NEW fsbo_listings row -- this is append-
+    only listing history, same discipline as `documents` and `evidence`,
+    so re-capturing the same listing later (a price change, a status
+    update) never erases the earlier capture. The underlying property/
+    owner rows DO dedup through the normal property_identity()/
+    owner_identity() mechanism (a FSBO listing for an address this
+    pipeline already knows about links to the SAME property_id, it
+    doesn't create a duplicate).
+
+    Applies the campaign's geography/property-type/individual-owner rules
+    via the same compute_campaign_eligibility() every other source uses.
+    A FSBO post very often doesn't give the legal owner's name at all --
+    when owner_name is blank, no owner row is created and eligibility
+    naturally comes back 'review' ("No confirmed owner on file"), i.e.
+    ownership verification pending, never assumed individual just because
+    it's the common case for a FSBO seller.
+
+    Returns (fsbo_listing_id, property_id, campaign_eligibility, reason)."""
+    if source not in FSBO_VALID_SOURCES:
+        raise ValueError(f"source must be one of {FSBO_VALID_SOURCES!r}, got {source!r}")
+    ts = now_iso()
+    lead_source = f"fsbo_{source}"
+
+    prop_id, _prop_conf = _upsert_property(
+        conn, ts, "", prop_address, prop_city, prop_state, prop_zip, lead_source=lead_source,
+    )
+
+    owner_id = None
+    if owner_name:
+        owner_type, evidence, otype_source = classify_owner_type(owner_name)
+        owner_id, _owner_conf = _upsert_owner(
+            conn, ts, owner_name, prop_address, prop_city, prop_state, prop_zip,
+            owner_type, evidence, otype_source, prop_id, f"fsbo_{source}_{prop_address}",
+        )
+        if prop_id and owner_id:
+            conn.execute(
+                "INSERT INTO ownerships (property_id, owner_id, is_current, first_seen_at, last_seen_at) "
+                "VALUES (?,?,1,?,?) ON CONFLICT(property_id, owner_id) DO UPDATE SET last_seen_at=excluded.last_seen_at",
+                (prop_id, owner_id, ts, ts),
+            )
+
+    eligibility, reason = compute_campaign_eligibility(conn, prop_id) if prop_id else \
+        ("review", "Property could not be matched/created -- no address or parcel on file.")
+
+    capture_date = capture_date or ts
+    # capture_date (truncated to the day) is part of the hash so re-running
+    # an identical import within the same day is idempotent (INSERT OR
+    # IGNORE below no-ops on a re-run), while a genuinely later re-capture
+    # of the same listing (a price change, a status check next week) gets
+    # its own new row -- this IS the append-only history, not a duplicate.
+    listing_id = _hash_id("fsbo", source, prop_address, prop_city, prop_zip, owner_name,
+                           posted_date or "", listing_url or "", str(capture_date)[:10])
+    conn.execute(
+        "INSERT OR IGNORE INTO fsbo_listings (id, property_id, owner_id, source, listing_url, asking_price, "
+        "posted_date, capture_date, seller_contact_method, property_facts, status, follow_up_date, "
+        "campaign_eligibility, campaign_eligibility_reason, raw_owner_name, created_by, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (listing_id, prop_id, owner_id, source, listing_url, asking_price, posted_date,
+         capture_date, seller_contact_method, property_facts, "new", follow_up_date,
+         eligibility, reason, owner_name, created_by, ts, ts),
+    )
+    conn.commit()
+    return listing_id, prop_id, eligibility, reason
+
+
+def reclassify_stale_owners(conn):
+    """One-time-per-stale-row backfill: every owner persisted before Phase
+    10 only ever got owner_type set to 'entity' or 'unknown' (the old
+    two-state logic never labeled a confirmed individual as 'individual'
+    at all -- see classify_owner_type()'s module note). Re-running
+    persist_records() wouldn't fix this on its own, since it only touches
+    owners tied to documents encountered in the current fetch window, not
+    every historical owner on file -- so this walks every owner whose
+    owner_type is NULL/empty/'unknown' and reclassifies from display_name.
+    Already-'entity'/'trust'/'estate' rows are left alone (those were
+    already evidenced, sticky per _upsert_owner's own rule). Pure regex,
+    no network -- cheap enough to call every run, same as Phase 3's
+    re-score-everything discipline."""
+    rows = conn.execute(
+        "SELECT id, display_name FROM owners WHERE owner_type IS NULL OR owner_type IN ('', 'unknown')"
+    ).fetchall()
+    n = 0
+    for r in rows:
+        owner_type, evidence, source = classify_owner_type(r["display_name"])
+        if owner_type == "unknown":
+            continue
+        is_entity, is_trust, is_estate = (int(owner_type == t) for t in ("entity", "trust", "estate"))
+        conn.execute(
+            "UPDATE owners SET owner_type=?, owner_type_evidence=?, owner_type_source=?, "
+            "is_entity=?, is_trust=CASE WHEN ? THEN 1 ELSE is_trust END, "
+            "is_estate=CASE WHEN ? THEN 1 ELSE is_estate END WHERE id=?",
+            (owner_type, evidence, source, is_entity, is_trust, is_estate, r["id"]),
+        )
+        n += 1
+    conn.commit()
+    return n
+
+
 def compute_dealability_for_all_properties(conn, run_id, config=None):
     """Runs after persist_records() for the run. Re-scores every property
     on file, not just ones touched this run -- cheap (pure SQL, no
@@ -1638,6 +2331,7 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
     dealability bar get a Tier 2 'estimate_mortgage_payoff' research task
     queued -- the real payoff lookup stays a deliberate per-property
     action, never automatic enrichment for every lead."""
+    reclassify_stale_owners(conn)
     config = config if config is not None else DEALABILITY_CONFIG
     ts = now_iso()
     tier2_threshold = config.get("tier2_mortgage_lookup_threshold", 50)
@@ -1656,6 +2350,10 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
         contact_priority_score, tier, tier_reason = compute_contact_priority_and_tier(
             score, distress_score, urgency_score, confidence_score
         )
+        # Phase 10: tenure priority needs the absentee_stage this same loop
+        # just wrote above it, so compute it before the valuations UPDATE
+        # rather than in a second pass over every property.
+        tenure_score, tenure_reason, _tenure_years, tenure_ambiguous = compute_tenure_priority(conn, property_id)
         conn.execute(
             "UPDATE valuations SET active_lien_count=?, has_tax_distress=?, "
             "equity_signal=?, equity_confidence=?, equity_reasoning=?, "
@@ -1664,14 +2362,27 @@ def compute_dealability_for_all_properties(conn, run_id, config=None):
             "code_enforcement_stage=?, code_violation_count=?, "
             "absentee_stage=?, landlord_portfolio_stage=?, "
             "portfolio_property_count=?, portfolio_distressed_count=?, "
-            "value_confidence=?, computed_at=? WHERE property_id=?",
+            "value_confidence=?, tenure_priority_score=?, tenure_priority_reason=?, "
+            "tenure_ambiguous_transfer=?, computed_at=? WHERE property_id=?",
             (lien_count, int(has_tax), signal, eq_conf, eq_reason,
              tax_stage, days_until_tax_sale,
              foreclosure_stage, days_since_foreclosure_milestone,
              code_stage, code_count,
              absentee_stage, landlord_stage, portfolio_count, portfolio_distressed_count,
-             "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN", ts, property_id),
+             "ESTIMATED" if signal != "UNKNOWN" else "UNKNOWN",
+             tenure_score, tenure_reason, tenure_ambiguous, ts, property_id),
         )
+        campaign_eligibility, campaign_reason = compute_campaign_eligibility(conn, property_id)
+        conn.execute(
+            "UPDATE properties SET campaign_eligibility=?, campaign_eligibility_reason=? WHERE id=?",
+            (campaign_eligibility, campaign_reason, property_id),
+        )
+        if campaign_eligibility == "review":
+            _add_research_task_if_absent(
+                conn, "confirm_campaign_eligibility", property_id=property_id,
+                description=f"campaign_eligibility=review: {campaign_reason}",
+                priority="normal",
+            )
         outreach_angle = compute_outreach_angle(conn, property_id, tier)
         conn.execute(
             "INSERT INTO scores (property_id, computed_at, distress_score, distress_reason, "

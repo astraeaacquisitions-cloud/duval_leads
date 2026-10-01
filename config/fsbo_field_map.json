@@ -1,0 +1,20 @@
+{
+  "_comment": "Phase 10 FSBO CSV intake field-mapping adapter, for manual export/spreadsheet capture of Facebook Marketplace / Zillow FSBO listings. Same first-match-wins, case-insensitive header resolution as config/propwire_field_map.json.",
+
+  "source": ["Source", "Platform"],
+  "listing_url": ["Listing URL", "URL", "Link"],
+  "asking_price": ["Asking Price", "Price"],
+  "posted_date": ["Posted Date", "Listed Date"],
+  "capture_date": ["Capture Date", "Date Captured", "Date Found"],
+  "seller_contact_method": ["Seller Contact Method", "Contact Method", "How To Contact"],
+  "property_facts": ["Property Facts", "Notes", "Description"],
+  "follow_up_date": ["Follow Up Date", "Follow-Up Date"],
+
+  "owner": ["Owner Name", "Seller Name", "Contact Name"],
+  "prop_address": ["Property Address", "Address"],
+  "prop_city": ["Property City", "City"],
+  "prop_state": ["Property State", "State"],
+  "prop_zip": ["Property Zip", "Zip", "Zip Code"],
+
+  "_source_comment": "The 'source' column value must say 'facebook' or 'zillow' (case-insensitive) -- anything else is rejected per row rather than guessed. If your capture sheet doesn't have a Source column at all, pass --source facebook or --source zillow on the command line to apply it to every row in the file."
+}
