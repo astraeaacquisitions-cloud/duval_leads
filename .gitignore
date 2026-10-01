@@ -1,4 +1,5 @@
 scraper_run.log
+scraper.log
 records.json
 __pycache__/
 *.pyc
